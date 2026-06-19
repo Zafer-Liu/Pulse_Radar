@@ -44,7 +44,7 @@ import { toast } from '../composables/useToast'
 
 const emit = defineEmits(['result', 'status'])
 
-const url = ref('https://www.bilibili.com/video/BV1Xi4y1x7eM')
+const url = ref('https://www.bilibili.com/video/BV1aGLR6mEeK/')
 const pages = ref(5)
 const loading = ref(false)
 

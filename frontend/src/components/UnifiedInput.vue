@@ -135,7 +135,7 @@ const emit = defineEmits(['result', 'topicResult', 'add'])
 const mode = ref('video')
 
 // 视频模式
-const url = ref('https://www.bilibili.com/video/BV1Xi4y1x7eM')
+const url = ref('https://www.bilibili.com/video/BV1aGLR6mEeK/')
 const pages = ref(5)
 const intervalValue = ref(6)
 const intervalUnit = ref('小时')
