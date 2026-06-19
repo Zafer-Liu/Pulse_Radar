@@ -33,15 +33,9 @@ server.log
 评分报告.md
 优化方案.md
 
-# 前端源码与依赖（已在 Dockerfile 构建阶段处理）
+# 前端（仅排除 node_modules，其余由 Dockerfile 构建阶段使用）
 frontend/node_modules/
-frontend/src/
-frontend/public/
-frontend/index.html
-frontend/vite.config.js
-frontend/package.json
-frontend/package-lock.json
-frontend/.gitignore
+frontend/dist/
 
 # 系统文件
 .DS_Store
