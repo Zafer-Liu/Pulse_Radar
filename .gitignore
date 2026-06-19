@@ -1,0 +1,40 @@
+# ===== 敏感文件（绝勿提交） =====
+cookies.txt
+data.json
+server.log
+server.log.*
+*.tmp
+
+# ===== 鉴权 / 密钥 =====
+.auth_token
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# ===== 前端构建 / 依赖 =====
+frontend/node_modules/
+frontend/dist/
+node_modules/
+dist/
+.vite/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== WorkBuddy 工作区 =====
+.workbuddy/
+
+# ===== 生成产物 / 内部文档（不开源） =====
+# 宣传片等生成的媒体产物与中间文件
+outputs/
+# 比赛内部提分策略与自评报告
+优化方案.md
+评分报告.md

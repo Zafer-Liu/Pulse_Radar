@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>声浪雷达 - 需要构建前端</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at 20% 0%, rgba(47,111,237,.10), transparent 32%), #f6f8fc;
+      color: #14213d; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0;
+    }
+    .box { background: rgba(255,255,255,.95); border: 1px solid #dbe3ef; border-radius: 18px; padding: 40px; max-width: 540px; box-shadow: 0 18px 45px rgba(20,33,61,.08); }
+    h1 { font-size: 24px; margin: 0 0 14px; letter-spacing: -.03em; }
+    code { background: #eef6ff; padding: 2px 6px; border-radius: 4px; font-family: Consolas, "Courier New", monospace; color: #2f6fed; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 12px; overflow-x: auto; font-size: 13px; }
+    .muted { color: #6b778d; font-size: 14px; line-height: 1.7; }
+    .tag { display: inline-block; background: rgba(22,199,132,.12); color: #16c784; border: 1px solid rgba(22,199,132,.25); padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <span class="tag">声浪雷达</span>
+    <h1>前端尚未构建</h1>
+    <p class="muted">后端未检测到 <code>frontend/dist</code> 目录。请先构建前端：</p>
+    <pre>cd frontend
+npm install
+npm run build</pre>
+    <p class="muted">构建完成后刷新本页即可。后端会自动使用 <code>frontend/dist</code> 作为静态资源目录。</p>
+    <p class="muted">如需开发调试，可单独运行 <code>npm run dev</code>（Vite 开发服务器），并让后端只提供 API。</p>
+  </div>
+</body>
+</html>

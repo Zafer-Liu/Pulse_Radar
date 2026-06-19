@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.python-version
+
+# 运行时数据（不进镜像，部署后由 Railway 卷或环境变量管理）
+cookies.txt
+data.json
+server.log
+*.log
+.auth_token
+
+# 敏感配置
+.env
+
+# 版本控制
+.git/
+.gitignore
+.gitattributes
+
+# IDE / 工具
+.workbuddy/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 文档（可选进镜像，但减小体积可排除）
+评分报告.md
+优化方案.md
+
+# 前端源码与依赖（已在 Dockerfile 构建阶段处理）
+frontend/node_modules/
+frontend/src/
+frontend/public/
+frontend/index.html
+frontend/vite.config.js
+frontend/package.json
+frontend/package-lock.json
+frontend/.gitignore
+
+# 系统文件
+.DS_Store
+Thumbs.db

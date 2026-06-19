@@ -1,0 +1,15 @@
+# 把这份文件复制为 cookies.txt 并填入你的 B 站登录态。
+# 这是抓取完整公开评论的唯一方式 —— B 站对未登录请求只下发 3 条精选评论。
+#
+# 获取方式：
+#   1. 用浏览器登录 https://www.bilibili.com/
+#   2. 按 F12 打开开发者工具，切到 “应用 / Application” -> “Cookies” -> https://www.bilibili.com
+#   3. 找到下面这几个键，把 Value 复制过来填到等号右边
+#   4. 保存为同目录下的 cookies.txt（不要加引号），重启 server.py
+#
+# 这些 Cookie 等价于你的登录态，不要泄露给他人。
+
+SESSDATA=
+bili_jct=
+DedeUserID=
+buvid3=
