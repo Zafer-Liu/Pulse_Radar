@@ -1918,6 +1918,13 @@ class Handler(SimpleHTTPRequestHandler):
                 self.json_response(400, {"ok": False, "error": str(exc)})
             return
 
+        # /api/auth/token — 返回 AUTH_TOKEN 给前端（用于远程部署时 POST 鉴权）
+        # 仅在 AUTH_TOKEN 已设置时返回，否则返回空，前端据此决定是否携带 Authorization 头
+        if parsed.path == "/api/auth/token":
+            token = os.environ.get("AUTH_TOKEN", "").strip()
+            self.json_response(200, {"ok": True, "token": token})
+            return
+
         if parsed.path == "/api/analyze":
             query = urllib.parse.parse_qs(parsed.query)
             raw_url = (query.get("url") or [""])[0]

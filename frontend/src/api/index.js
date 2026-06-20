@@ -2,6 +2,21 @@
  * 后端 API 统一封装
  */
 
+let _authToken = null
+
+/** 启动时从后端获取 AUTH_TOKEN（远程部署时 POST 鉴权需要） */
+export async function initAuth() {
+  try {
+    const res = await fetch('/api/auth/token')
+    const payload = await res.json()
+    if (payload.ok && payload.token) {
+      _authToken = payload.token
+    }
+  } catch {
+    // 本地运行时 AUTH_TOKEN 为空，无需携带
+  }
+}
+
 export async function apiGet(url) {
   const res = await fetch(url)
   const payload = await res.json()
@@ -10,9 +25,13 @@ export async function apiGet(url) {
 }
 
 export async function apiPost(url, data) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (_authToken) {
+    headers['Authorization'] = `Bearer ${_authToken}`
+  }
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(data || {}),
   })
   const payload = await res.json()

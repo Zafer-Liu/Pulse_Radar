@@ -127,7 +127,7 @@ import EmptyState from './components/ui/EmptyState.vue'
 import { useLogin } from './composables/useLogin'
 import { useMonitors } from './composables/useMonitors'
 import { toast } from './composables/useToast'
-import { getAlertConfig } from './api'
+import { getAlertConfig, initAuth } from './api'
 
 const login = useLogin()
 const monitors = useMonitors()
@@ -147,7 +147,7 @@ async function loadAlertStatus() {
     // 静默失败，不影响主流程
   }
 }
-onMounted(loadAlertStatus)
+onMounted(() => { initAuth(); loadAlertStatus() })
 
 function onResult(data) {
   analysisData.value = data
