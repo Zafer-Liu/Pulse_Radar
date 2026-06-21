@@ -87,6 +87,18 @@ def _load_env_file() -> None:
 _load_env_file()
 
 try:
+    from analysis import xhs_client
+except Exception as _xhs_exc:  # noqa: BLE001
+    xhs_client = None  # type: ignore
+    logging.getLogger("xhs_client").debug("analysis.xhs_client 加载失败(%s)，小红书功能不可用。", _xhs_exc)
+
+try:
+    from analysis import xhs_login
+except Exception as _xhs_login_exc:  # noqa: BLE001
+    xhs_login = None  # type: ignore
+    logging.getLogger("xhs_login").debug("analysis.xhs_login 加载失败(%s)，小红书扫码登录不可用。", _xhs_login_exc)
+
+try:
     from analysis.llm_report import generate_report as _llm_generate_report, is_available as _llm_available
 except Exception as _llm_exc:  # noqa: BLE001
     _llm_generate_report = None  # type: ignore
@@ -249,6 +261,18 @@ def setup_logger() -> logging.Logger:
     except Exception as exc:
         log.warning(f"日志文件无法初始化：{exc}")
     log.propagate = False
+
+    # 为子模块 logger 添加相同的 handler，使 xhs_client/xhs_login 等日志也能输出
+    for sub_name in ("xhs_client", "xhs_login", "xhs_sign", "lexicon", "llm_report", "llm_sentiment", "alert", "agent_core"):
+        sub_log = logging.getLogger(sub_name)
+        sub_log.setLevel(logging.DEBUG)
+        sub_log.addHandler(console)
+        try:
+            sub_log.addHandler(file_handler)
+        except Exception:
+            pass
+        sub_log.propagate = False
+
     return log
 
 
@@ -639,7 +663,7 @@ def http_get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, A
 
 def _is_allowed_image_host(host: str) -> bool:
     host = (host or "").lower()
-    allowed_hosts = ("hdslb.com", "bilibili.com", "bilivideo.com")
+    allowed_hosts = ("hdslb.com", "bilibili.com", "bilivideo.com", "sns-webpic-qc.xhscdn.com", "ci.xiaohongshu.com")
     return any(host == h or host.endswith("." + h) for h in allowed_hosts)
 
 
@@ -1529,6 +1553,131 @@ def _make_topic_report(
     return "\n".join(lines)
 
 
+def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> dict[str, Any]:
+    """小红书话题聚合分析：搜索笔记 → 抓取评论 → 聚合分析。"""
+    logger.info(f"开始小红书话题分析：keyword={keyword} top_n={top_n} pages={pages_per_note}")
+    
+    # 搜索笔记
+    search_result = xhs_client.search_notes(keyword, page=1, page_size=top_n)
+    notes = search_result.get("results", [])
+    
+    if not notes:
+        raise RuntimeError(f"搜索不到相关笔记：{keyword}")
+    
+    all_comments = []
+    video_results = []
+    
+    for i, note in enumerate(notes[:top_n]):
+        note_id = note["id"]
+        xsec_token = note.get("xsecToken", "")
+        title = note.get("title", f"笔记 {i+1}")
+        
+        logger.info(f"[{i+1}/{min(top_n, len(notes))}] 分析笔记: {title[:30]}")
+        
+        try:
+            # 获取评论
+            comments = xhs_client.fetch_comments(note_id, xsec_token, max_pages=pages_per_note)
+            
+            # 情感标注
+            for c in comments:
+                c["sentiment"] = score_text(c["text"])["label"]
+            
+            # 单笔记统计
+            dist = Counter(c["sentiment"] for c in comments)
+            total = max(1, sum(dist.values()))
+            sent_pct = {k: round(dist.get(k, 0) * 100 / total, 1) for k in ["pos", "neu", "neg", "con", "risk"]}
+            
+            video_results.append({
+                "noteId": note_id,
+                "title": title,
+                "author": note.get("user", {}).get("nickname", ""),
+                "platform": "小红书",
+                "commentCount": len(comments),
+                "sentiments": sent_pct,
+                "sentimentCounts": dict(dist),
+                "risk": risk_level(sent_pct, len(comments))[0],
+            })
+            
+            all_comments.extend(comments)
+            
+        except Exception as exc:
+            logger.warning(f"笔记分析失败: {title[:30]} - {exc}")
+            video_results.append({
+                "noteId": note_id,
+                "title": title,
+                "author": note.get("user", {}).get("nickname", ""),
+                "platform": "小红书",
+                "commentCount": 0,
+                "error": str(exc),
+            })
+    
+    # 聚合分析
+    for c in all_comments:
+        if "sentiment" not in c:
+            c["sentiment"] = score_text(c["text"])["label"]
+    
+    dist_counter = Counter(c["sentiment"] for c in all_comments)
+    sentiments = {k: dist_counter.get(k, 0) for k in ["pos", "neu", "neg", "con", "risk"]}
+    total = max(1, sum(sentiments.values()))
+    sentiment_percent = {k: round(v * 100 / total, 1) for k, v in sentiments.items()}
+    risk, reason = risk_level(sentiments, len(all_comments))
+    keywords = extract_keywords(all_comments)
+    keywords_weighted = extract_keywords_weighted(all_comments)
+    clusters = build_clusters(all_comments)
+    hot_comments = sorted(all_comments, key=lambda x: x.get("likes", 0), reverse=True)[:50]
+    
+    report = _make_xhs_topic_report(keyword, video_results, sentiments, keywords, clusters)
+    
+    return {
+        "type": "xhs_topic",
+        "keyword": keyword,
+        "searchTotal": search_result.get("total", 0),
+        "analyzedCount": len(video_results),
+        "totalComments": len(all_comments),
+        "videos": video_results,
+        "risk": risk,
+        "riskReason": reason,
+        "sentiments": sentiment_percent,
+        "sentimentCounts": sentiments,
+        "keywords": keywords,
+        "keywordsWeighted": keywords_weighted,
+        "clusters": clusters,
+        "comments": hot_comments,
+        "report": report,
+        "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _make_xhs_topic_report(keyword, videos, sentiments, keywords, clusters):
+    """生成小红书话题分析文本报告。"""
+    lines = [f"# 小红书话题舆情报告：{keyword}\n"]
+    lines.append(f"## 概览\n")
+    lines.append(f"- 分析笔记数：{len(videos)}")
+    total_c = sum(v.get("commentCount", 0) for v in videos)
+    lines.append(f"- 总评论数：{total_c}")
+    lines.append(f"- 正面 {sentiments.get('pos', 0):.1f}% / 中性 {sentiments.get('neu', 0):.1f}% / 负面 {sentiments.get('neg', 0):.1f}%")
+    lines.append("")
+    
+    for v in videos:
+        lines.append(f"### {v.get('title', '未知')}")
+        lines.append(f"- 作者：{v.get('author', '未知')} | 评论数：{v.get('commentCount', 0)}")
+        s = v.get("sentiments", {})
+        lines.append(f"- 情感：正面 {s.get('pos', 0):.1f}% / 中性 {s.get('neu', 0):.1f}% / 负面 {s.get('neg', 0):.1f}%")
+        if v.get("error"):
+            lines.append(f"- ⚠️ 分析失败：{v['error']}")
+        lines.append("")
+    
+    if keywords:
+        lines.append("## 热门关键词\n" + "、".join(keywords[:20]))
+    
+    if clusters:
+        lines.append("\n## 观点聚类")
+        for cl in clusters[:8]:
+            lines.append(f"- **{cl.get('topic', '')}**（{cl.get('size', 0)} 条，{cl.get('sentiment', '')}）")
+    
+    return "\n".join(lines)
+
+
 def analyze_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
     logger.info(f"开始分析：url={raw_url} pages={pages}")
     final_url, bvid = resolve_bvid(raw_url)
@@ -1606,6 +1755,98 @@ def analyze_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         "clusters": clusters,
         "comments": hot_comments,
         "report": make_report(video, replies, sentiments, keywords, clusters),
+        "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
+    """分析小红书笔记评论。"""
+    logger.info(f"开始小红书分析：url={raw_url} pages={pages}")
+    try:
+        final_url, note_id, xsec_token = xhs_client.resolve_note_id(raw_url)
+        logger.info(f"链接解析成功：note_id={note_id} xsec_token={'有' if xsec_token else '无'}")
+    except Exception as exc:
+        logger.error(f"链接解析失败：{exc}")
+        raise RuntimeError(f"链接解析失败：{exc}") from exc
+    
+    try:
+        note_info = xhs_client.fetch_note_info(note_id, xsec_token)
+        logger.info(f"笔记详情获取成功：title={note_info.get('title', '')[:30]} author={note_info.get('user', {}).get('nickname', '')}")
+    except Exception as exc:
+        logger.error(f"笔记详情获取失败：{exc}")
+        raise RuntimeError(f"获取笔记详情失败：{exc}") from exc
+    
+    # 优先使用笔记返回的 xsec_token
+    token = xsec_token or note_info.get("xsecToken", "")
+    
+    try:
+        comments_raw = xhs_client.fetch_comments(note_id, token, max_pages=pages)
+        logger.info(f"评论获取完成：共 {len(comments_raw)} 条")
+    except Exception as exc:
+        logger.error(f"评论获取失败：{exc}")
+        raise RuntimeError(f"获取评论失败：{exc}") from exc
+    
+    # 复用现有分析管线
+    for c in comments_raw:
+        c["sentiment"] = score_text(c["text"])["label"]
+    
+    dist_counter = Counter(c["sentiment"] for c in comments_raw)
+    sentiments = {key: dist_counter.get(key, 0) for key in ["pos", "neu", "neg", "con", "risk"]}
+    total = max(1, sum(sentiments.values()))
+    sentiment_percent = {key: round(value * 100 / total, 1) for key, value in sentiments.items()}
+    risk, reason = risk_level(sentiments, len(comments_raw))
+    keywords = extract_keywords(comments_raw)
+    keywords_weighted = extract_keywords_weighted(comments_raw)
+    clusters = build_clusters(comments_raw)
+    hot_comments = sorted(comments_raw, key=lambda x: x.get("likes", 0), reverse=True)[:30]
+    
+    logger.info(f"分析完成：sentiments={sentiments} risk={risk} keywords={len(keywords)} clusters={len(clusters)}")
+    
+    user = note_info.get("user", {})
+    interact = note_info.get("interactInfo", {})
+    
+    # 构建用于报告的类 video 结构
+    note_for_report = {
+        "title": note_info.get("title", ""),
+        "desc": note_info.get("desc", ""),
+        "author": user.get("nickname", ""),
+    }
+    
+    needs_login = len(comments_raw) <= 5
+    xhs_cookies = xhs_client.load_xhs_cookies()
+    
+    return {
+        "sourceUrl": raw_url,
+        "finalUrl": final_url,
+        "noteId": note_id,
+        "title": note_info.get("title", ""),
+        "author": user.get("nickname", ""),
+        "authorId": user.get("userId", ""),
+        "platform": "小红书",
+        "time": note_info.get("time", 0),  # Unix 时间戳
+        "desc": note_info.get("desc", ""),
+        "type": note_info.get("type", ""),
+        "ipLocation": note_info.get("ipLocation", ""),
+        "pic": note_info.get("imageList", [{}])[0].get("url", "") if note_info.get("imageList") else "",
+        "likes": interact.get("likes", "0"),
+        "collected": interact.get("collectedCount", "0"),
+        "commentCount": len(comments_raw),
+        "replyCountFromNote": int(interact.get("commentCount", 0) or 0),
+        "needsLogin": needs_login,
+        "loginHint": (
+            "小红书对未登录请求限流，只能获取少量评论。"
+            "请设置环境变量 XHS_A1 和 XHS_WEB_SESSION，"
+            "或在项目目录下创建 cookies_xhs.txt 写入 a1=xxx 和 web_session=xxx。"
+        ) if needs_login else "",
+        "risk": risk,
+        "riskReason": reason,
+        "sentiments": sentiment_percent,
+        "sentimentCounts": sentiments,
+        "keywords": keywords,
+        "keywordsWeighted": keywords_weighted,
+        "clusters": clusters,
+        "comments": hot_comments,
+        "report": make_report(note_for_report, comments_raw, sentiments, keywords, clusters),
         "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -2041,6 +2282,68 @@ class Handler(SimpleHTTPRequestHandler):
                 self.json_response(400, {"ok": False, "error": str(exc)})
             return
 
+        # ---- 小红书 API ----
+
+        if parsed.path == "/api/xhs/analyze":
+            query = urllib.parse.parse_qs(parsed.query)
+            url = (query.get("url") or [""])[0].strip()
+            pages = int((query.get("pages") or ["5"])[0])
+            if not url:
+                self.json_response(400, {"ok": False, "error": "请输入小红书笔记链接。"})
+                return
+            try:
+                result = analyze_xhs_url(url, pages=min(max(1, pages), 20))
+                self.json_response(200, {"ok": True, "data": result})
+            except RuntimeError as exc:
+                self.json_response(502, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                logger.exception("小红书分析异常")
+                self.json_response(500, {"ok": False, "error": f"分析失败：{exc}"})
+            return
+
+        # 小红书 Cookie 状态
+        if parsed.path == "/api/xhs/login/status":
+            cookies = xhs_client.load_xhs_cookies()
+            configured = bool(cookies.get("a1"))
+            self.json_response(200, {
+                "ok": True,
+                "data": {
+                    "configured": configured,
+                    "cookies": {k: v for k, v in cookies.items()} if configured else {},
+                },
+            })
+            return
+
+        if parsed.path == "/api/xhs/search":
+            query = urllib.parse.parse_qs(parsed.query)
+            keyword = (query.get("keyword") or [""])[0].strip()
+            page = int((query.get("page") or ["1"])[0])
+            page_size = int((query.get("pageSize") or ["20"])[0])
+            if not keyword:
+                self.json_response(400, {"ok": False, "error": "请输入搜索关键词。"})
+                return
+            try:
+                result = xhs_client.search_notes(keyword, page=page, page_size=page_size)
+                self.json_response(200, {"ok": True, "data": result})
+            except Exception as exc:
+                self.json_response(502, {"ok": False, "error": f"搜索失败：{exc}"})
+            return
+
+        if parsed.path == "/api/xhs/topic/analyze":
+            query = urllib.parse.parse_qs(parsed.query)
+            keyword = (query.get("keyword") or [""])[0].strip()
+            top_n = int((query.get("topN") or ["5"])[0])
+            pages = int((query.get("pages") or ["3"])[0])
+            if not keyword:
+                self.json_response(400, {"ok": False, "error": "请输入话题关键词。"})
+                return
+            try:
+                result = analyze_xhs_topic(keyword, top_n=min(max(1, top_n), 10), pages_per_note=min(max(1, pages), 10))
+                self.json_response(200, {"ok": True, "data": result})
+            except Exception as exc:
+                self.json_response(502, {"ok": False, "error": str(exc)})
+            return
+
         # ---- 阶段三：策略生成 Agent / 趋势分析 API ----
 
         if parsed.path == "/api/agent/trace":
@@ -2123,6 +2426,73 @@ class Handler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/login/qrcode":
                 info = login_qrcode_generate()
                 self.json_response(200, {"ok": True, "data": info})
+                return
+
+            # 小红书扫码登录 - 生成二维码（API 方式，和 B站一样）
+            if parsed.path == "/api/xhs/login/qrcode":
+                if xhs_login is None:
+                    self.json_response(503, {"ok": False, "error": "服务器未安装 playwright，无法扫码登录"})
+                    return
+                try:
+                    result = xhs_login.create_qrcode()
+                    self.json_response(200, {"ok": True, "data": {
+                        "url": result["url"],
+                        "qr_id": result["qr_id"],
+                        "code": result["code"],
+                    }})
+                except Exception as exc:
+                    logger.exception("小红书二维码生成失败")
+                    self.json_response(502, {"ok": False, "error": f"生成二维码失败：{exc}"})
+                return
+
+            # 小红书扫码登录 - 轮询状态（API 方式，和 B站一样）
+            if parsed.path == "/api/xhs/login/poll":
+                if xhs_login is None:
+                    self.json_response(503, {"ok": False, "error": "服务器未安装 playwright"})
+                    return
+                qr_id = (body.get("qr_id") or "").strip()
+                code = (body.get("code") or "").strip()
+                if not qr_id or not code:
+                    self.json_response(400, {"ok": False, "error": "缺少 qr_id 或 code"})
+                    return
+                try:
+                    result = xhs_login.poll_qrcode(qr_id, code)
+                    resp_data = {"code_status": result["code_status"]}
+                    if result["code_status"] == 2 and result.get("cookies"):
+                        resp_data["cookies"] = result["cookies"]
+                        # 强制让抓取链路重新读取最新 Cookie
+                        globals()["SESSION_READY"] = False
+                    self.json_response(200, {"ok": True, "data": resp_data})
+                except Exception as exc:
+                    logger.exception("小红书扫码轮询失败")
+                    self.json_response(502, {"ok": False, "error": str(exc)})
+                return
+
+            # 小红书 Cookie 保存
+            if parsed.path == "/api/xhs/login/cookies":
+                a1 = (body.get("a1") or "").strip()
+                web_session = (body.get("web_session") or "").strip()
+                web_id = (body.get("webId") or "").strip()
+                if not a1:
+                    self.json_response(400, {"ok": False, "error": "a1 是必填项"})
+                    return
+                # 写入 cookies_xhs.txt
+                try:
+                    cookie_file = ROOT / "cookies_xhs.txt"
+                    lines = []
+                    if a1:
+                        lines.append(f"a1={a1}")
+                    if web_session:
+                        lines.append(f"web_session={web_session}")
+                    if web_id:
+                        lines.append(f"webId={web_id}")
+                    cookie_file.write_text("\n".join(lines), encoding="utf-8")
+                    # 清除客户端缓存，下次请求重新读取
+                    xhs_client._cookie_cache = None
+                    logger.info(f"小红书 Cookie 已保存到 {cookie_file}")
+                    self.json_response(200, {"ok": True, "data": {"configured": True}})
+                except Exception as exc:
+                    self.json_response(500, {"ok": False, "error": f"保存失败：{exc}"})
                 return
 
             if parsed.path == "/api/login/poll":

@@ -5,6 +5,12 @@
       <p class="hero-desc">粘贴 B站视频链接一键分析，或输入话题关键词全网搜索聚合分析。</p>
     </div>
 
+    <!-- 平台选择 -->
+    <div class="platform-tabs">
+      <button :class="{ active: platform === 'bilibili' }" @click="platform = 'bilibili'">B站</button>
+      <button :class="{ active: platform === 'xiaohongshu' }" @click="platform = 'xiaohongshu'">小红书</button>
+    </div>
+
     <!-- 模式切换 -->
     <div class="mode-tabs">
       <button
@@ -30,7 +36,7 @@
       <input
         v-model="url"
         class="input hero-url"
-        placeholder="粘贴 B站视频链接，例如 https://www.bilibili.com/video/BV..."
+        :placeholder="platform === 'bilibili' ? '粘贴 B站视频链接，例如 https://www.bilibili.com/video/BV...' : '粘贴小红书笔记链接，例如 https://www.xiaohongshu.com/explore/...'"
         :disabled="loading || adding"
       />
       <select v-model.number="pages" class="select hero-pages" :disabled="loading || adding">
@@ -126,16 +132,24 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
-import { analyzeVideo, analyzeTopic } from '../api'
+import { ref, watch } from 'vue'
+import { analyzeVideo, analyzeTopic, analyzeXhsNote, analyzeXhsTopic } from '../api'
 import { toast } from '../composables/useToast'
 
 const emit = defineEmits(['result', 'topicResult', 'add'])
 
+const platform = ref('bilibili')  // 'bilibili' | 'xiaohongshu'
 const mode = ref('video')
 
 // 视频模式
-const url = ref('https://www.bilibili.com/video/BV1aGLR6mEeK/')
+const BILI_DEFAULT = 'https://www.bilibili.com/video/BV1aGLR6mEeK/'
+const XHS_DEFAULT = 'http://xhslink.com/o/95N0n1vuoQd'
+const url = ref(BILI_DEFAULT)
+
+// 切换平台时更新默认 URL
+watch(platform, (val) => {
+  url.value = val === 'bilibili' ? BILI_DEFAULT : XHS_DEFAULT
+})
 const pages = ref(5)
 const intervalValue = ref(6)
 const intervalUnit = ref('小时')
@@ -151,13 +165,18 @@ const topicLoading = ref(false)
 
 async function doAnalyze() {
   if (!url.value.trim()) {
-    toast.warning('请先输入视频链接')
+    toast.warning(platform.value === 'bilibili' ? '请先输入视频链接' : '请先输入笔记链接')
     return
   }
   loading.value = true
   toast.info('开始分析，正在抓取评论…')
   try {
-    const payload = await analyzeVideo(url.value.trim(), pages.value)
+    let payload
+    if (platform.value === 'bilibili') {
+      payload = await analyzeVideo(url.value.trim(), pages.value)
+    } else {
+      payload = await analyzeXhsNote(url.value.trim(), pages.value)
+    }
     emit('result', payload.data)
     toast.success(`分析完成：实际抓取 ${payload.data.commentCount} 条公开评论`)
   } catch (err) {
@@ -173,12 +192,17 @@ async function doTopicAnalyze() {
     return
   }
   topicLoading.value = true
-  toast.info('开始话题分析，搜索相关视频并抓取评论，可能需要较长时间...')
+  toast.info('开始话题分析，搜索相关内容并抓取评论，可能需要较长时间...')
   try {
-    const payload = await analyzeTopic(topicKeyword.value.trim(), topicTopN.value, topicPages.value)
+    let payload
+    if (platform.value === 'bilibili') {
+      payload = await analyzeTopic(topicKeyword.value.trim(), topicTopN.value, topicPages.value)
+    } else {
+      payload = await analyzeXhsTopic(topicKeyword.value.trim(), topicTopN.value, topicPages.value)
+    }
     emit('topicResult', payload.data)
     const d = payload.data
-    toast.success(`话题分析完成：${d.analyzedCount} 个视频，共 ${d.totalComments} 条评论`)
+    toast.success(`话题分析完成：${d.analyzedCount} 个内容，共 ${d.totalComments} 条评论`)
   } catch (err) {
     toast.error(err.message || String(err))
   } finally {
@@ -236,6 +260,28 @@ async function doAddMonitor() {
   font-size: var(--fs-sm);
   line-height: var(--lh-loose);
   max-width: 720px;
+}
+
+/* 平台选择 */
+.platform-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.platform-tabs button {
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: transparent;
+  color: var(--text2);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  transition: all 0.2s;
+}
+.platform-tabs button.active {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
 }
 
 /* 模式切换 */

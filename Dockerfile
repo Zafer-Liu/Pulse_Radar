@@ -18,19 +18,34 @@ FROM python:3.13-slim
 WORKDIR /app
 
 # 系统依赖：jieba 的 C 扩展需要 gcc/g++；python3-dev 提供头文件
+# Playwright 需要 libnss3, libnspr4, libatk1.0, libatk-bridge2.0, libcups2,
+# libdrm2, libdbus-1-3, libxcb1, libxkbcommon0, libx11-6, libxcomposite1,
+# libxdamage1, libxext6, libxfixes3, libxrandr2, libgbm1, libpango-1.0-0,
+# libcairo2, libasound2 等共享库
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc g++ python3-dev \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libx11-6 \
+        libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+        libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Python 依赖（先装依赖，利用层缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 安装 Playwright Chromium 浏览器（用于小红书扫码登录）
+RUN python -m playwright install chromium --with-deps
+
 # 复制后端代码 + 数据文件
 COPY server.py ./
 COPY analysis/ ./analysis/
 COPY data/ ./data/
 COPY .env.example ./.env.example
+
+# 复制小红书 Cookie 文件（如果存在；Railway 部署时推荐用 XHS_COOKIES 环境变量替代）
+# .dockerignore 不排除 cookies_xhs.txt，本地 docker build 时可带入
+COPY cookies_xhs.txt* ./
 
 # 从前端构建阶段复制 dist 产物（server.py 检测到 dist 存在会跳过 build_frontend）
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist

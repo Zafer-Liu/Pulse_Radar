@@ -18,9 +18,14 @@
             <h2>{{ data.title || '未命名视频' }}</h2>
             <div class="meta">
               <span>{{ data.author || '未知作者' }}</span>
-              <span>{{ data.platform || 'B站' }}</span>
+              <span :class="['platform-badge', `platform-${data.platform === '小红书' ? 'xhs' : 'bili'}`]">{{ data.platform || 'B站' }}</span>
               <span v-if="data.time">{{ data.time }}</span>
-              <span class="font-mono">{{ data.bvid || '' }}</span>
+              <template v-if="data.platform === '小红书'">
+                <span v-if="data.noteId" class="font-mono">笔记ID: {{ data.noteId }}</span>
+              </template>
+              <template v-else>
+                <span v-if="data.bvid" class="font-mono">{{ data.bvid }}</span>
+              </template>
             </div>
             <div v-if="data.risk" :class="['risk', `risk-${data.risk}`]">{{ riskText[data.risk] || '未知风险' }}</div>
             <p v-if="data.riskReason" class="risk-reason">{{ data.riskReason }}</p>
@@ -392,6 +397,21 @@ async function copyUrl() {
 .cover { width: 100%; aspect-ratio: 16 / 10; object-fit: cover; border-radius: var(--r-lg); border: 1px solid var(--border-1); background: var(--fill-1); }
 .video-info h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: var(--sp-2); line-height: var(--lh-tight); }
 .video-info .meta { margin-bottom: var(--sp-3); }
+.platform-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+.platform-badge.platform-bili {
+  background: rgba(0, 174, 236, 0.1);
+  color: #00aee6;
+}
+.platform-badge.platform-xhs {
+  background: rgba(255, 42, 65, 0.1);
+  color: #ff2a41;
+}
 .risk-reason { color: var(--text-2); font-size: var(--fs-sm); margin: var(--sp-2) 0 0; line-height: var(--lh-base); }
 
 /* 情绪区 */

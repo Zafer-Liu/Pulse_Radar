@@ -130,3 +130,16 @@ export function getUpTrend(author, limit = 5) {
 export function getTopicTrend(keyword, limit = 5) {
   return apiGet(`/api/trend/topic?keyword=${encodeURIComponent(keyword)}&limit=${limit}`)
 }
+
+// ---- 小红书 ----
+export function analyzeXhsNote(url, pages) {
+  return apiGet(`/api/xhs/analyze?url=${encodeURIComponent(url)}&pages=${encodeURIComponent(pages)}`)
+}
+
+export function searchXhsNotes(keyword, page = 1, pageSize = 20) {
+  return apiGet(`/api/xhs/search?keyword=${encodeURIComponent(keyword)}&page=${page}&pageSize=${pageSize}`)
+}
+
+export function analyzeXhsTopic(keyword, topN = 5, pages = 3) {
+  return apiGet(`/api/xhs/topic/analyze?keyword=${encodeURIComponent(keyword)}&topN=${topN}&pages=${pages}`)
+}

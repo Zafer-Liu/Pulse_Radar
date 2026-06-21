@@ -7,7 +7,7 @@ server.log.*
 
 # ===== 鉴权 / 密钥 =====
 .auth_token
-
+cookies_xhs.txt
 # ===== Python =====
 __pycache__/
 *.pyc

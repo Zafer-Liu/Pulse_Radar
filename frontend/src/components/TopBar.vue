@@ -18,6 +18,7 @@
 
       <!-- 右侧操作 -->
       <div class="topbar-actions">
+        <!-- 功能图标 -->
         <button
           class="icon-btn"
           :class="{ 'icon-btn-active': alertConfigured }"
@@ -59,14 +60,23 @@
           </svg>
         </button>
 
-        <span :class="['badge', loggedIn ? 'badge-success' : 'badge-neutral', 'badge-dot', { pulse: !loggedIn }]">
-          {{ loggedIn ? `已登录 · UID ${uid}` : '未登录' }}
-        </span>
+        <!-- 分隔线 -->
+        <span class="action-divider"></span>
 
-        <button v-if="!loggedIn" class="btn btn-sm" @click="$emit('open-login')">
-          登录 B站
-        </button>
-        <button v-else class="btn btn-sm btn-secondary" @click="$emit('logout')">退出</button>
+        <!-- B站登录状态 -->
+        <span v-if="loggedIn" :class="['badge', 'badge-success', 'badge-dot']">
+          B站 · UID {{ uid }}
+        </span>
+        <button v-else class="btn btn-sm" @click="$emit('open-login')">登录 B站</button>
+
+        <!-- 小红书登录状态 -->
+        <span v-if="xhsLoggedIn" :class="['badge', 'badge-success', 'badge-dot']">
+          小红书已登录
+        </span>
+        <button v-else class="btn btn-sm btn-secondary" @click="$emit('open-xhs-login')">登录 小红书</button>
+
+        <!-- 退出按钮（任一平台登录后显示，最右侧） -->
+        <button v-if="loggedIn || xhsLoggedIn" class="btn btn-sm btn-secondary" @click="$emit('logout')">退出</button>
       </div>
     </div>
   </header>
@@ -79,8 +89,9 @@ defineProps({
   loggedIn: Boolean,
   uid: { type: String, default: '' },
   alertConfigured: { type: Boolean, default: false },
+  xhsLoggedIn: { type: Boolean, default: false },
 })
-defineEmits(['open-login', 'open-settings', 'open-alert', 'logout'])
+defineEmits(['open-login', 'open-settings', 'open-alert', 'logout', 'open-xhs-login'])
 
 const { theme, toggle } = useTheme()
 </script>
@@ -124,6 +135,12 @@ const { theme, toggle } = useTheme()
   letter-spacing: .02em;
 }
 .topbar-actions { display: flex; align-items: center; gap: var(--sp-3); }
+.action-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border-1);
+  margin: 0 var(--sp-1);
+}
 .icon-btn {
   width: 32px; height: 32px;
   display: inline-flex; align-items: center; justify-content: center;

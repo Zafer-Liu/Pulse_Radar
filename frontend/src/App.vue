@@ -5,7 +5,9 @@
       :logged-in="login.loggedIn.value"
       :uid="login.uid.value"
       :alert-configured="alertConfigured"
+      :xhs-logged-in="xhsLoggedIn"
       @open-login="login.openModal()"
+      @open-xhs-login="xhsLoginShow = true"
       @open-settings="settingsShow = true"
       @open-alert="alertShow = true"
       @logout="login.doLogout()"
@@ -104,6 +106,12 @@
         @close="alertShow = false"
         @saved="onAlertSaved"
       />
+
+      <XhsLoginModal
+        :show="xhsLoginShow"
+        @close="xhsLoginShow = false"
+        @success="loadXhsStatus"
+      />
     </div>
 
     <!-- 全局 Toast -->
@@ -122,12 +130,13 @@ import TopicResult from './components/TopicResult.vue'
 import LoginModal from './components/LoginModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import AlertModal from './components/AlertModal.vue'
+import XhsLoginModal from './components/XhsLoginModal.vue'
 import AppToast from './components/AppToast.vue'
 import EmptyState from './components/ui/EmptyState.vue'
 import { useLogin } from './composables/useLogin'
 import { useMonitors } from './composables/useMonitors'
 import { toast } from './composables/useToast'
-import { getAlertConfig, initAuth } from './api'
+import { getAlertConfig, initAuth, apiGet } from './api'
 
 const login = useLogin()
 const monitors = useMonitors()
@@ -137,6 +146,18 @@ const topicData = ref(null)
 const settingsShow = ref(false)
 const alertShow = ref(false)
 const alertConfigured = ref(false)
+const xhsLoginShow = ref(false)
+const xhsLoggedIn = ref(false)
+
+// 检查小红书 Cookie 配置状态
+async function loadXhsStatus() {
+  try {
+    const res = await apiGet('/api/xhs/login/status')
+    xhsLoggedIn.value = !!res.data?.configured
+  } catch {
+    xhsLoggedIn.value = false
+  }
+}
 
 // 启动时检查告警配置状态（用于 TopBar 铃铛上的绿点）
 async function loadAlertStatus() {
@@ -147,7 +168,7 @@ async function loadAlertStatus() {
     // 静默失败，不影响主流程
   }
 }
-onMounted(() => { initAuth(); loadAlertStatus() })
+onMounted(() => { initAuth(); loadAlertStatus(); loadXhsStatus() })
 
 function onResult(data) {
   analysisData.value = data

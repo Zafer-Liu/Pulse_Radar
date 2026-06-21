@@ -7,3 +7,8 @@
 # 中文分词 + TF-IDF 关键词抽取，用于词典法情感分析与关键词提取。
 # 缺失时 server.py 会自动降级为子串匹配，但分析质量明显下降。
 jieba>=0.42.1
+
+# Playwright - 小红书扫码登录（无头浏览器方案）
+# 首次使用需额外执行：python -m playwright install chromium
+# Railway/Docker 部署时 Dockerfile 中已包含安装步骤
+playwright>=1.40.0
