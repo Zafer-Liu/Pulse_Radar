@@ -229,15 +229,26 @@ def _request(
 
     # 生成 X-s 签名
     # 优先使用 Playwright 的 window._webmsxyw() 签名（v55，有效）
-    # 回退到旧签名（可能无效，但至少不会崩溃）
+    # 如果签名超时（可能是 worker 线程忙），等待后重试一次
+    # 仅当重试仍失败时才回退到旧签名（可能无效）
     a1 = cookies.get("a1", "")
     post_body = body if (method.upper() == "POST" and body) else None
-    try:
-        signs = xhs_login._sign(sign_uri, post_body, a1=a1)
-        req_headers["X-s"] = signs["x-s"]
-        req_headers["X-t"] = signs["x-t"]
-    except Exception as exc:
-        logger.warning(f"Playwright 签名失败，回退到旧签名: {exc}")
+    signed = False
+    for sign_attempt in range(2):
+        try:
+            signs = xhs_login._sign(sign_uri, post_body, a1=a1)
+            req_headers["X-s"] = signs["x-s"]
+            req_headers["X-t"] = signs["x-t"]
+            signed = True
+            break
+        except Exception as exc:
+            if sign_attempt == 0:
+                logger.warning(f"Playwright 签名首次失败，1 秒后重试: {exc}")
+                time.sleep(1)
+            else:
+                logger.warning(f"Playwright 签名重试仍失败，回退到旧签名: {exc}")
+
+    if not signed:
         xs = xhs_sign.sign(parsed.path, a1, params=body if post_body else params, method=method)
         req_headers["X-s"] = xs
         req_headers["X-t"] = str(int(time.time() * 1000))
@@ -585,20 +596,37 @@ def fetch_comments(
 ) -> list[dict[str, Any]]:
     """获取笔记评论（含子评论）。
 
-    优先使用 Playwright 导航到笔记页面，从 DOM 提取评论（避免 461 验证码）。
-    如果 Playwright 不可用，回退到 API 调用。
+    策略：
+    1. 优先用 Playwright DOM 提取初始评论（避免 461 验证码）
+    2. 然后用 API 翻页获取更多评论（通过浏览器 fetch 自动签名，避免签名超时）
+    3. 合并去重
 
     Args:
         note_id: 笔记 ID
         xsec_token: 安全令牌
-        max_pages: 最大翻页数（DOM 方式忽略此参数）
+        max_pages: 最大翻页数
 
     Returns:
         标准格式评论列表:
         [{user, mid, text, likes, time, rpid, ip_location}, ...]
     """
-    # 优先用 Playwright 从 DOM 提取评论
     logger.info(f"fetch_comments 开始：note_id={note_id} xsec_token={'有' if xsec_token else '无'} max_pages={max_pages}")
+
+    all_comments: list[dict[str, Any]] = []
+    seen_mids: set[str] = set()
+
+    def _add_comment(c: dict[str, Any]) -> None:
+        mid = c.get("mid", "")
+        if mid and mid in seen_mids:
+            return
+        if mid:
+            seen_mids.add(mid)
+        all_comments.append(c)
+
+    # ============================================================
+    # 阶段1：Playwright DOM 提取初始评论
+    # ============================================================
+    dom_ok = False
     if xhs_login.is_available():
         try:
             from urllib.parse import quote
@@ -613,21 +641,18 @@ def fetch_comments(
             # 优先用 __INITIAL_STATE__ 中的评论（数据更完整）
             state_comments = result.get("stateComments", [])
             if state_comments:
-                all_comments = []
                 for c in state_comments:
-                    all_comments.append(to_standard_comments(c))
-                    # 子评论
+                    _add_comment(to_standard_comments(c))
                     for sc in c.get("sub_comments", []):
-                        all_comments.append(to_standard_comments(sc))
+                        _add_comment(to_standard_comments(sc))
                 logger.info(f"从 __INITIAL_STATE__ 提取评论: {len(all_comments)} 条")
-                return all_comments
+                dom_ok = True
 
             # 回退到 DOM 评论
-            dom_comments = result.get("domComments", [])
-            if dom_comments:
-                all_comments = []
+            if not all_comments:
+                dom_comments = result.get("domComments", [])
                 for i, c in enumerate(dom_comments):
-                    all_comments.append({
+                    _add_comment({
                         "user": {"nickname": c.get("user", ""), "user_id": ""},
                         "mid": f"dom_{i}",
                         "text": c.get("content", ""),
@@ -636,65 +661,83 @@ def fetch_comments(
                         "rpid": "",
                         "ip_location": "",
                     })
-                logger.info(f"从 DOM 提取评论: {len(all_comments)} 条")
-                return all_comments
+                if all_comments:
+                    logger.info(f"从 DOM 提取评论: {len(all_comments)} 条")
+                    dom_ok = True
 
-            logger.warning("DOM 和 State 评论均为空")
+            if not all_comments:
+                logger.warning("DOM 和 State 评论均为空")
         except Exception as exc:
-            logger.warning(f"Playwright 提取评论失败，回退到 API: {exc}")
+            logger.warning(f"Playwright 提取评论失败: {exc}")
 
-    # 回退：通过 API 获取评论
-    logger.info(f"fetch_comments 回退到 API 方式：note_id={note_id}")
-    all_comments: list[dict[str, Any]] = []
-    cursor = ""
+    # ============================================================
+    # 阶段2：API 翻页获取更多评论
+    # ============================================================
+    # 如果 DOM 提取成功但评论较少，或者 DOM 提取失败，尝试 API 翻页
+    should_try_api = (not dom_ok) or (len(all_comments) < 20)
+    if should_try_api:
+        logger.info(f"fetch_comments 尝试 API 翻页获取更多评论（当前 {len(all_comments)} 条）")
+        cursor = ""
+        try:
+            for page_num in range(max_pages):
+                params: dict[str, Any] = {
+                    "note_id": note_id,
+                    "cursor": cursor,
+                    "image_formats": "jpg,webp,avif",
+                    "top_comment_id": "",
+                    "xsec_token": xsec_token,
+                }
+                params = {k: v for k, v in params.items() if v}
 
-    try:
-        for page in range(max_pages):
-            params: dict[str, Any] = {
-                "note_id": note_id,
-                "cursor": cursor,
-                "image_formats": "jpg,webp,avif",
-                "top_comment_id": "",
-                "xsec_token": xsec_token,
-            }
+                api_url = "https://edith.xiaohongshu.com/api/sns/web/v2/comment/page"
+                query = urlencode(sorted(params.items()))
+                full_api_url = f"{api_url}?{query}" if query else api_url
 
-            # 移除空值参数
-            params = {k: v for k, v in params.items() if v}
+                # 优先用浏览器 fetch（自动签名+Cookie，避免签名队列超时）
+                data = None
+                if xhs_login.is_available():
+                    try:
+                        fetch_result = xhs_login.fetch_via_browser(full_api_url, method="GET")
+                        if fetch_result.get("status") == 200:
+                            data = json.loads(fetch_result["body"])
+                        else:
+                            logger.warning(f"浏览器 fetch 返回 {fetch_result.get('status')}: {fetch_result.get('body', '')[:200]}")
+                    except Exception as fetch_exc:
+                        logger.warning(f"浏览器 fetch 失败，回退到 _request: {fetch_exc}")
 
-            url = "https://edith.xiaohongshu.com/api/sns/web/v2/comment/page"
-            data = _request(url, method="GET", params=params)
-            _random_delay()
+                # 回退到 _request（带 Playwright 签名 + 重试）
+                if data is None:
+                    data = _request(api_url, method="GET", params=params)
 
-            if data.get("code") != 0 or "data" not in data:
-                error_msg = data.get("msg", "未知错误")
-                logger.warning(f"获取评论失败 page={page}: {error_msg}")
-                break
+                _random_delay()
 
-            comment_data = data["data"]
-            comments = comment_data.get("comments", [])
-            cursor = comment_data.get("cursor", "")
-            has_more = comment_data.get("has_more", False)
+                if data.get("code") != 0 or "data" not in data:
+                    error_msg = data.get("msg", "未知错误")
+                    logger.warning(f"API 获取评论失败 page={page_num}: {error_msg}")
+                    break
 
-            # 转换评论格式
-            for c in comments:
-                all_comments.append(to_standard_comments(c))
-                # 子评论
-                sub_comments = c.get("sub_comments", [])
-                for sc in sub_comments:
-                    all_comments.append(to_standard_comments(sc))
+                comment_data = data["data"]
+                comments = comment_data.get("comments", [])
+                cursor = comment_data.get("cursor", "")
+                has_more = comment_data.get("has_more", False)
 
-            logger.info(
-                f"评论第 {page + 1} 页: 获取 {len(comments)} 条主评论, "
-                f"累计 {len(all_comments)} 条"
-            )
+                before = len(all_comments)
+                for c in comments:
+                    _add_comment(to_standard_comments(c))
+                    sub_comments = c.get("sub_comments", [])
+                    for sc in sub_comments:
+                        _add_comment(to_standard_comments(sc))
 
-            if not has_more or not cursor:
-                break
-    except Exception as api_exc:
-        logger.warning(f"API 获取评论也失败: {api_exc}")
-        if not all_comments:
-            logger.warning("Playwright 和 API 均未获取到评论，返回空列表")
-            return []
+                added = len(all_comments) - before
+                logger.info(f"API 评论第 {page_num + 1} 页: 新增 {added} 条, 累计 {len(all_comments)} 条")
+
+                if not has_more or not cursor:
+                    break
+        except Exception as api_exc:
+            logger.warning(f"API 获取评论失败: {api_exc}")
+            if not all_comments:
+                logger.warning("DOM 和 API 均未获取到评论，返回空列表")
+                return []
 
     logger.info(f"评论抓取完成: note_id={note_id} 共 {len(all_comments)} 条")
     return all_comments

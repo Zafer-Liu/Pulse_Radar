@@ -1812,7 +1812,14 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         "author": user.get("nickname", ""),
     }
     
-    needs_login = len(comments_raw) <= 5
+    reply_count_from_note = int(interact.get("commentCount", 0) or 0)
+    # 仅在以下情况提示"需要登录"：
+    # 1. 完全没有获取到评论（0 条）→ 肯定是登录/限流问题
+    # 2. 获取到少量评论（≤5 条）且笔记实际评论数远大于此（>15 条）→ 可能被限流
+    # 如果笔记本身就只有几条评论，不应该提示"抓取不全"
+    needs_login = len(comments_raw) == 0 or (
+        len(comments_raw) <= 5 and reply_count_from_note > 15
+    )
     xhs_cookies = xhs_client.load_xhs_cookies()
     
     return {
@@ -1831,7 +1838,7 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         "likes": interact.get("likes", "0"),
         "collected": interact.get("collectedCount", "0"),
         "commentCount": len(comments_raw),
-        "replyCountFromNote": int(interact.get("commentCount", 0) or 0),
+        "replyCountFromNote": reply_count_from_note,
         "needsLogin": needs_login,
         "loginHint": (
             "小红书对未登录请求限流，只能获取少量评论。"

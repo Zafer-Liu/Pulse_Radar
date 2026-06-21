@@ -154,19 +154,21 @@ def _worker_loop():
             user_agent=_UA,
             viewport={"width": 1280, "height": 720},
         )
+
+        # 关键修复：先注入 Cookie，再访问页面
+        # 如果先访问页面再注入 Cookie，小红书会将此会话标记为"未登录"，
+        # 后续导航到笔记页面时会被重定向到登录页。
+        # 先注入 Cookie，浏览器首次请求就携带登录态，服务器从一开始就认为是登录用户。
+        saved_cookies = _load_saved_cookies()
+        if saved_cookies:
+            context.add_cookies(saved_cookies)
+            logger.info(f"签名服务：已注入 {len(saved_cookies)} 个用户 Cookie（在页面加载前）")
+
         page = context.new_page()
 
         logger.info("签名服务：正在加载小红书页面...")
         page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
-
-        # 如果用户已登录（cookies_xhs.txt 存在），注入保存的 cookie
-        # 不重新加载页面，避免触发验证码
-        # 这样签名用的 a1 和请求用的 a1 一致，避免 406
-        saved_cookies = _load_saved_cookies()
-        if saved_cookies:
-            context.add_cookies(saved_cookies)
-            logger.info("签名服务：已注入用户 Cookie（不重新加载页面）")
 
         # 获取 a1 cookie（优先用用户保存的）
         cookies = context.cookies()
@@ -242,6 +244,21 @@ def _worker_loop():
                     comment_page.goto(nav_url, wait_until="networkidle", timeout=30000)
                     current_url = comment_page.url
                     logger.info(f"评论页面导航完成: {current_url}")
+
+                    # 检测是否被重定向到登录页
+                    if "/login" in current_url or "redirectPath" in current_url:
+                        logger.warning("评论页面被重定向到登录页，Cookie 可能未生效")
+                        _result_queue.put({
+                            "ok": True,
+                            "result": {
+                                "domComments": [],
+                                "stateComments": [],
+                                "domCount": 0,
+                                "debug": {"title": "登录页", "url": current_url, "bodyLength": 0},
+                                "loginRedirect": True,
+                            },
+                        })
+                        continue
 
                     # 等待页面完全渲染
                     time.sleep(2)
@@ -385,8 +402,22 @@ def _worker_loop():
                 fetch_method = cmd[2] if len(cmd) > 2 else "GET"
                 fetch_body = cmd[3] if len(cmd) > 3 else None
                 try:
+                    # 使用 window._webmsxyw() 生成签名，然后带签名发起 fetch
+                    # 这样一个命令就完成签名+请求，避免签名队列超时
                     js_code = """
                     async ([url, method, body]) => {
+                        // 生成签名
+                        let signData = null;
+                        try {
+                            const path = new URL(url).pathname + new URL(url).search;
+                            const webmsxyw = window._webmsxyw;
+                            if (webmsxyw) {
+                                signData = webmsxyw(path, method === 'POST' ? body : undefined);
+                            }
+                        } catch(e) {
+                            console.log('sign error:', e);
+                        }
+
                         const opts = {
                             method: method,
                             credentials: 'include',
@@ -395,6 +426,11 @@ def _worker_loop():
                                 'Content-Type': 'application/json',
                             }
                         };
+                        // 添加签名头
+                        if (signData) {
+                            opts.headers['X-s'] = signData['X-s'];
+                            opts.headers['X-t'] = String(signData['X-t']);
+                        }
                         if (body && method === 'POST') {
                             opts.body = JSON.stringify(body);
                         }
@@ -464,7 +500,7 @@ def _sign(uri: str, data: dict | None = None, a1: str = "") -> dict[str, str]:
 
     _cmd_queue.put(("sign", uri, data, a1))
     try:
-        result = _result_queue.get(timeout=15)
+        result = _result_queue.get(timeout=30)
         if result.get("ok"):
             return result["signs"]
         raise RuntimeError(f"签名失败: {result.get('error', '未知错误')}")

@@ -143,7 +143,7 @@ const mode = ref('video')
 
 // 视频模式
 const BILI_DEFAULT = 'https://www.bilibili.com/video/BV1aGLR6mEeK/'
-const XHS_DEFAULT = 'http://xhslink.com/o/95N0n1vuoQd'
+const XHS_DEFAULT = 'http://xhslink.com/o/5qUQb0IKAoC'
 const url = ref(BILI_DEFAULT)
 
 // 切换平台时更新默认 URL
