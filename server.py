@@ -2488,7 +2488,7 @@ class Handler(SimpleHTTPRequestHandler):
                         lines.append(f"webId={web_id}")
                     cookie_file.write_text("\n".join(lines), encoding="utf-8")
                     # 清除客户端缓存，下次请求重新读取
-                    xhs_client._cookie_cache = None
+                    xhs_client._cookies_cache = None
                     logger.info(f"小红书 Cookie 已保存到 {cookie_file}")
                     self.json_response(200, {"ok": True, "data": {"configured": True}})
                 except Exception as exc:

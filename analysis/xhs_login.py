@@ -59,31 +59,77 @@ def _is_playwright_available() -> bool:
 
 
 def _load_saved_cookies() -> list[dict]:
-    """从 cookies_xhs.txt 读取已保存的 cookie，返回 Playwright cookie 格式。"""
+    """读取已保存的 cookie，返回 Playwright cookie 格式。
+
+    读取顺序（合并，后者覆盖前者）：
+        1. cookies_xhs.txt（本地文件）
+        2. XHS_COOKIES 环境变量（整体 Cookie 字符串）
+        3. XHS_A1 / XHS_WEB_SESSION 等单独环境变量
+
+    这样 Railway 等云平台通过环境变量配置的 Cookie 也能被
+    Playwright 签名服务使用，避免签名无效和登录墙问题。
+    """
+    import os
     from pathlib import Path
 
+    cookie_dict: dict[str, str] = {}
+
+    # 1. 从 cookies_xhs.txt 读取（本地文件）
     root = Path(__file__).resolve().parent.parent
     cookie_file = root / "cookies_xhs.txt"
-    if not cookie_file.exists():
-        return []
+    if cookie_file.exists():
+        try:
+            raw = cookie_file.read_text(encoding="utf-8").strip()
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                cookie_dict[key.strip()] = value.strip()
+            logger.info(f"签名服务：从 cookies_xhs.txt 加载 {len(cookie_dict)} 个 Cookie")
+        except Exception as e:
+            logger.warning(f"签名服务：读取 cookies_xhs.txt 失败: {e}")
 
+    # 2. 从 XHS_COOKIES 环境变量读取（整体 Cookie 字符串）
+    xhs_cookies_str = os.environ.get("XHS_COOKIES", "").strip()
+    if xhs_cookies_str:
+        for pair in xhs_cookies_str.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                key, _, value = pair.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if key and value:
+                    cookie_dict[key] = value
+        logger.info(f"签名服务：从 XHS_COOKIES 环境变量加载，共 {len(cookie_dict)} 个字段")
+
+    # 3. 从单独环境变量读取（覆盖同名字段）
+    env_map = {
+        "XHS_A1": "a1",
+        "XHS_WEB_SESSION": "web_session",
+        "XHS_WEB_ID": "webId",
+        "XHS_XSECAPPID": "xsecappid",
+        "XHS_AB_REQUEST_ID": "abRequestId",
+        "XHS_ACW_TC": "acw_tc",
+    }
+    env_loaded = 0
+    for env_key, cookie_key in env_map.items():
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            cookie_dict[cookie_key] = val
+            env_loaded += 1
+    if env_loaded > 0:
+        logger.info(f"签名服务：从单独环境变量加载 {env_loaded} 个 Cookie")
+
+    # 转换为 Playwright cookie 格式
     cookies = []
-    try:
-        raw = cookie_file.read_text(encoding="utf-8").strip()
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            cookies.append({
-                "name": key.strip(),
-                "value": value.strip(),
-                "domain": ".xiaohongshu.com",
-                "path": "/",
-            })
-        logger.info(f"签名服务：从 cookies_xhs.txt 加载 {len(cookies)} 个 Cookie")
-    except Exception as e:
-        logger.warning(f"签名服务：读取 cookies_xhs.txt 失败: {e}")
+    for name, value in cookie_dict.items():
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": ".xiaohongshu.com",
+            "path": "/",
+        })
     return cookies
 
 
