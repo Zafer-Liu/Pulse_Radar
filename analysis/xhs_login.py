@@ -169,6 +169,22 @@ def _worker_loop():
             elif cmd_type == "get_a1":
                 _result_queue.put({"ok": True, "a1": _a1_value})
 
+            elif cmd_type == "get_browser_cookies":
+                # 获取 Playwright 浏览器中的所有 Cookie（用于扫码登录后保存完整 cookie）
+                try:
+                    all_cookies = context.cookies()
+                    cookie_dict = {}
+                    for c in all_cookies:
+                        name = c.get("name", "")
+                        value = c.get("value", "")
+                        if name and value:
+                            cookie_dict[name] = value
+                    logger.info(f"获取浏览器 Cookie: {len(cookie_dict)} 个字段 ({list(cookie_dict.keys())})")
+                    _result_queue.put({"ok": True, "cookies": cookie_dict})
+                except Exception as e:
+                    logger.warning(f"获取浏览器 Cookie 失败: {e}")
+                    _result_queue.put({"ok": False, "error": str(e)})
+
             elif cmd_type == "navigate_and_extract_comments":
                 # 导航到笔记页面，等待评论加载，从 DOM 提取评论
                 # 使用新标签页，避免干扰签名页面
@@ -424,6 +440,28 @@ def get_a1() -> str:
     return _a1_value
 
 
+def get_browser_cookies() -> dict:
+    """获取 Playwright 浏览器中的所有 Cookie。
+
+    用于扫码登录成功后，从浏览器获取完整 Cookie（包括 webId、xsecappid 等
+    API 响应中不包含的字段）。
+
+    Returns:
+        Cookie 字典，如 {"a1": "xxx", "web_session": "xxx", "webId": "xxx", ...}
+        如果签名服务不可用则返回空字典。
+    """
+    if not _ensure_worker():
+        return {}
+    _cmd_queue.put(("get_browser_cookies",))
+    try:
+        result = _result_queue.get(timeout=10)
+        if result.get("ok"):
+            return result.get("cookies", {})
+    except queue.Empty:
+        pass
+    return {}
+
+
 def fetch_via_browser(url: str, method: str = "GET", body: dict | None = None) -> dict:
     """在 Playwright 浏览器中直接调用 API。
 
@@ -612,11 +650,24 @@ def poll_qrcode(qr_id: str, code: str) -> dict:
     ret = {"code_status": code_status, "login_info": {}, "cookies": {}}
     if code_status == 2:
         ret["login_info"] = data.get("login_info", {})
-        # 合并 cookies
+        # 合并 cookies：API 响应的 Set-Cookie + Playwright 浏览器中的完整 cookie
         merged = {"a1": a1}
         merged.update(resp_cookies)
+
+        # 从 Playwright 浏览器获取完整 cookie（包含 webId、xsecappid 等）
+        try:
+            browser_cookies = get_browser_cookies()
+            if browser_cookies:
+                # 浏览器 cookie 优先级低于 API 响应（API 响应的是最新登录凭证）
+                for k, v in browser_cookies.items():
+                    if k not in merged:
+                        merged[k] = v
+                logger.info(f"从浏览器补充 Cookie: {list(browser_cookies.keys())}")
+        except Exception as e:
+            logger.warning(f"从浏览器获取 Cookie 失败: {e}")
+
         ret["cookies"] = merged
-        logger.info(f"小红书扫码登录成功！获取到 {len(merged)} 个 Cookie")
+        logger.info(f"小红书扫码登录成功！获取到 {len(merged)} 个 Cookie: {list(merged.keys())}")
         _save_cookies(merged)
 
     return ret

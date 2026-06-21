@@ -2519,7 +2519,25 @@ class Handler(SimpleHTTPRequestHandler):
                         except Exception:
                             pass
                 globals()["SESSION_READY"] = False
-                logger.info("已清空登录态。")
+                logger.info("B站登录已退出。")
+                self.json_response(200, {"ok": True})
+                return
+
+            if parsed.path == "/api/xhs/login/logout":
+                # 小红书退出登录
+                try:
+                    xhs_cookie_file = ROOT / "cookies_xhs.txt"
+                    if xhs_cookie_file.exists():
+                        xhs_cookie_file.unlink()
+                except Exception as exc:
+                    logger.warning(f"删除 cookies_xhs.txt 失败：{exc}")
+                # 清除 xhs_client 的 cookie 缓存
+                try:
+                    from analysis import xhs_client
+                    xhs_client._cookies_cache = None
+                except Exception:
+                    pass
+                logger.info("小红书登录已退出。")
                 self.json_response(200, {"ok": True})
                 return
 
