@@ -698,16 +698,28 @@ def fetch_comments(
                 if xhs_login.is_available():
                     try:
                         fetch_result = xhs_login.fetch_via_browser(full_api_url, method="GET")
-                        if fetch_result.get("status") == 200:
-                            data = json.loads(fetch_result["body"])
+                        status = fetch_result.get("status")
+                        if status == 200:
+                            try:
+                                data = json.loads(fetch_result["body"])
+                            except json.JSONDecodeError:
+                                logger.warning(f"浏览器 fetch 返回非 JSON: {fetch_result.get('body', '')[:200]}")
+                        elif status == 461:
+                            # 461 = 小红书验证码，签名可能无效或被风控
+                            # 不重试浏览器 fetch，直接用 _request（带 Playwright 签名）
+                            logger.warning(f"浏览器 fetch 返回 461（验证码），回退到 _request")
                         else:
-                            logger.warning(f"浏览器 fetch 返回 {fetch_result.get('status')}: {fetch_result.get('body', '')[:200]}")
+                            logger.warning(f"浏览器 fetch 返回 {status}: {fetch_result.get('body', '')[:200]}")
                     except Exception as fetch_exc:
                         logger.warning(f"浏览器 fetch 失败，回退到 _request: {fetch_exc}")
 
                 # 回退到 _request（带 Playwright 签名 + 重试）
                 if data is None:
-                    data = _request(api_url, method="GET", params=params)
+                    try:
+                        data = _request(api_url, method="GET", params=params)
+                    except Exception as req_exc:
+                        logger.warning(f"_request 也失败: {req_exc}")
+                        break
 
                 _random_delay()
 

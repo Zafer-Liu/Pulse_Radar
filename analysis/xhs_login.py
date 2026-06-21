@@ -40,6 +40,106 @@ _UA = (
 )
 
 # ============================================================
+# Stealth 反检测脚本
+# 小红书会检测 navigator.webdriver 等无头浏览器特征，
+# 检测到后会重定向到登录页，即使注入了有效 Cookie 也会被拦截。
+# 此脚本在每个页面加载前注入，隐藏自动化特征。
+# ============================================================
+_STEALTH_JS = """
+// 1. 覆盖 navigator.webdriver（最关键）
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => false,
+    configurable: true,
+});
+
+// 2. 添加 window.chrome 对象
+if (!window.chrome) {
+    window.chrome = {
+        runtime: {},
+        app: { isInstalled: false },
+        csi: () => {},
+        loadTimes: () => {},
+    };
+}
+
+// 3. 修改 navigator.plugins（模拟真实浏览器有插件）
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const plugins = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+        ];
+        plugins.length = 3;
+        return plugins;
+    },
+    configurable: true,
+});
+
+// 4. 修改 navigator.languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['zh-CN', 'zh', 'en-US', 'en'],
+    configurable: true,
+});
+
+// 5. 修改 navigator.permissions.query
+const originalQuery = window.navigator.permissions ? window.navigator.permissions.query : null;
+if (originalQuery) {
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters);
+}
+
+// 6. 修改 WebGL 渲染器信息（隐藏虚拟显卡）
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) {
+        return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
+    }
+    if (parameter === 37446) {
+        return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+    }
+    return getParameter.call(this, parameter);
+};
+
+// 7. 修改 navigator.connection（模拟真实网络连接）
+if (!navigator.connection) {
+    Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+            effectiveType: '4g',
+            rtt: 50,
+            downlink: 10,
+            saveData: false,
+        }),
+        configurable: true,
+    });
+}
+
+// 8. 隐藏 Playwright 自动化特征
+delete window.__playwright__evaluator;
+delete window.__pw_manual;
+
+// 9. 修改 navigator.platform（与 UA 一致）
+Object.defineProperty(navigator, 'platform', {
+    get: () => 'Win32',
+    configurable: true,
+});
+
+// 10. 添加 navigator.hardwareConcurrency
+Object.defineProperty(navigator, 'hardwareConcurrency', {
+    get: () => 8,
+    configurable: true,
+});
+
+// 11. 添加 navigator.deviceMemory
+Object.defineProperty(navigator, 'deviceMemory', {
+    get: () => 8,
+    configurable: true,
+});
+"""
+
+# ============================================================
 # 签名服务 -- 后台线程运行 Playwright
 # ============================================================
 
@@ -149,11 +249,30 @@ def _worker_loop():
 
     try:
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True)
+        # 添加反检测启动参数，隐藏自动化特征
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certificate-errors",
+                "--ignore-certificate-errors-spki-list",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
         context = browser.new_context(
             user_agent=_UA,
             viewport={"width": 1280, "height": 720},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
         )
+
+        # 关键：添加 stealth 反检测脚本到 context
+        # 这样所有新页面（包括评论提取的标签页）都会在加载前执行
+        context.add_init_script(_STEALTH_JS)
 
         # 关键修复：先注入 Cookie，再访问页面
         # 如果先访问页面再注入 Cookie，小红书会将此会话标记为"未登录"，
@@ -161,6 +280,11 @@ def _worker_loop():
         # 先注入 Cookie，浏览器首次请求就携带登录态，服务器从一开始就认为是登录用户。
         saved_cookies = _load_saved_cookies()
         if saved_cookies:
+            # 完善 Cookie 属性，确保被正确发送
+            for c in saved_cookies:
+                c["secure"] = True
+                c["httpOnly"] = c["name"] in ("web_session", "a1")
+                c["sameSite"] = "Lax"
             context.add_cookies(saved_cookies)
             logger.info(f"签名服务：已注入 {len(saved_cookies)} 个用户 Cookie（在页面加载前）")
 
@@ -169,6 +293,31 @@ def _worker_loop():
         logger.info("签名服务：正在加载小红书页面...")
         page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
+
+        # 检测签名服务页面是否被重定向到登录页
+        init_url = page.url
+        if "/login" in init_url:
+            logger.warning(f"签名服务页面被重定向到登录页: {init_url}，stealth 可能未完全生效")
+            # 尝试重新加载（stealth 脚本可能在第二次加载时生效）
+            time.sleep(2)
+            page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+            if "/login" in page.url:
+                logger.error("签名服务页面仍被重定向到登录页，签名功能可能不可用")
+            else:
+                logger.info(f"签名服务页面重载成功: {page.url}")
+        else:
+            logger.info(f"签名服务页面加载成功: {init_url}")
+
+        # 验证 window._webmsxyw 是否存在（签名函数）
+        try:
+            has_sign_fn = page.evaluate("typeof window._webmsxyw === 'function'")
+            if has_sign_fn:
+                logger.info("签名服务：window._webmsxyw 签名函数可用")
+            else:
+                logger.error("签名服务：window._webmsxyw 不存在，签名将失败！页面可能未正确加载")
+        except Exception as e:
+            logger.warning(f"签名服务：检查 _webmsxyw 失败: {e}")
 
         # 获取 a1 cookie（优先用用户保存的）
         cookies = context.cookies()
@@ -240,14 +389,34 @@ def _worker_loop():
                 comment_page = None
                 try:
                     comment_page = context.new_page()
-                    # networkidle 等待网络空闲，确保页面完全加载
-                    comment_page.goto(nav_url, wait_until="networkidle", timeout=30000)
-                    current_url = comment_page.url
-                    logger.info(f"评论页面导航完成: {current_url}")
 
-                    # 检测是否被重定向到登录页
+                    # 带重试的导航：如果被重定向到登录页，等待后重试
+                    # stealth 脚本可能需要页面加载一次后才完全生效
+                    current_url = ""
+                    for nav_attempt in range(3):
+                        comment_page.goto(nav_url, wait_until="networkidle", timeout=30000)
+                        current_url = comment_page.url
+                        logger.info(f"评论页面导航完成 (attempt {nav_attempt + 1}/3): {current_url}")
+
+                        # 检测是否被重定向到登录页
+                        if "/login" not in current_url and "redirectPath" not in current_url:
+                            break
+
+                        logger.warning(f"评论页面被重定向到登录页 (attempt {nav_attempt + 1})，等待后重试")
+                        if nav_attempt < 2:
+                            time.sleep(3)
+                            # 重新注入 Cookie，确保登录态
+                            saved = _load_saved_cookies()
+                            if saved:
+                                for c in saved:
+                                    c["secure"] = True
+                                    c["httpOnly"] = c["name"] in ("web_session", "a1")
+                                    c["sameSite"] = "Lax"
+                                context.add_cookies(saved)
+
+                    # 如果仍然被重定向到登录页，返回空结果
                     if "/login" in current_url or "redirectPath" in current_url:
-                        logger.warning("评论页面被重定向到登录页，Cookie 可能未生效")
+                        logger.warning("评论页面重试 3 次仍被重定向到登录页，Cookie 可能已过期")
                         _result_queue.put({
                             "ok": True,
                             "result": {
