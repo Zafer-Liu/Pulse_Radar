@@ -1575,8 +1575,10 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
         logger.info(f"[{i+1}/{min(top_n, len(notes))}] 分析笔记: {title[:30]}")
         
         try:
+            # 获取笔记详情（用于提取评论）
+            ni = xhs_client.fetch_note_info(note_id, xsec_token)
             # 获取评论
-            comments = xhs_client.fetch_comments(note_id, xsec_token, max_pages=pages_per_note)
+            comments = xhs_client.fetch_comments(note_id, xsec_token, max_pages=pages_per_note, note_info=ni)
             
             # 情感标注
             for c in comments:
@@ -1780,7 +1782,7 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
     token = xsec_token or note_info.get("xsecToken", "")
     
     try:
-        comments_raw = xhs_client.fetch_comments(note_id, token, max_pages=pages)
+        comments_raw = xhs_client.fetch_comments(note_id, token, max_pages=pages, note_info=note_info)
         logger.info(f"评论获取完成：共 {len(comments_raw)} 条")
     except Exception as exc:
         logger.error(f"评论获取失败：{exc}")
