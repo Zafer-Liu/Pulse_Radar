@@ -17,7 +17,7 @@
       <p v-if="data.riskReason" class="risk-reason">{{ data.riskReason }}</p>
       <div class="overview-stats">
         <div class="stat"><b>{{ fmt(data.searchTotal) }}</b><span>搜索结果</span></div>
-        <div class="stat"><b>{{ data.analyzedCount }}</b><span>分析视频</span></div>
+        <div class="stat"><b>{{ data.analyzedCount }}</b><span>{{ isXhs ? '分析笔记' : '分析视频' }}</span></div>
         <div class="stat"><b>{{ fmt(data.totalComments) }}</b><span>聚合评论</span></div>
       </div>
     </section>
@@ -69,7 +69,7 @@
 
         <!-- 热门评论 -->
         <section class="card anim-card" style="--i:3">
-          <h3>热门评论（跨视频聚合）</h3>
+          <h3>热门评论（{{ isXhs ? '跨笔记' : '跨视频' }}聚合）</h3>
           <div v-if="(data.comments || []).length" class="comments">
             <div v-for="c in data.comments.slice(0, 20)" :key="c.rpid" class="comment">
               <div class="comment-head">
@@ -87,18 +87,19 @@
 
       <!-- 右侧栏 -->
       <div class="side-col">
-        <!-- 各视频分析 -->
+        <!-- 各内容分析 -->
         <section class="card anim-card" style="--i:0">
-          <h3>各视频分析</h3>
+          <h3>{{ isXhs ? '各笔记分析' : '各视频分析' }}</h3>
           <div class="video-list">
-            <div v-for="(v, i) in (data.videos || [])" :key="v.bvid" class="video-item">
+            <div v-for="(v, i) in (data.videos || [])" :key="v.bvid || v.noteId || i" class="video-item">
               <div class="vi-rank">{{ i + 1 }}</div>
               <img class="vi-cover" :src="proxyImage(v.pic || '')" alt="" @error="onCoverError" />
               <div class="vi-info">
-                <a :href="v.arcurl" target="_blank" class="vi-title">{{ v.title || '未知' }}</a>
+                <a :href="v.arcurl || v.noteUrl || '#'" target="_blank" class="vi-title">{{ v.title || '未知' }}</a>
                 <div class="vi-meta">
                   <span>{{ v.author || '' }}</span>
-                  <span>播放 {{ fmt(v.views) }}</span>
+                  <span v-if="!isXhs">播放 {{ fmt(v.views) }}</span>
+                  <span v-else>评论 {{ fmt(v.commentCount) }}</span>
                 </div>
                 <div v-if="v.error" class="vi-error">分析失败：{{ v.error }}</div>
                 <template v-else>
@@ -137,6 +138,9 @@ const props = defineProps({ data: Object })
 const sentimentOrder = ['pos', 'neu', 'neg', 'con', 'risk']
 const sentimentLabels = { pos: '正面', neu: '中性', neg: '负面', con: '争议', risk: '风险' }
 const riskText = { low: '低风险', medium: '中风险', high: '高风险', unknown: '未知' }
+
+// 判断是否为小红书话题分析结果
+const isXhs = computed(() => props.data?.type === 'xhs_topic')
 
 function segClass(k) {
   return { pos: 'seg-pos', neu: 'seg-neu', neg: 'seg-neg', con: 'seg-con', risk: 'seg-risk' }[k] || ''

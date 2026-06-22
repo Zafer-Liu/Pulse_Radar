@@ -86,6 +86,10 @@ export function logout() {
   return apiPost('/api/login/logout')
 }
 
+export function xhsLogout() {
+  return apiPost('/api/xhs/login/logout')
+}
+
 // ---- LLM 配置 ----
 export function getLLMConfig() {
   return apiGet('/api/config/llm')

@@ -1,5 +1,6 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getLoginStatus, requestQrcode, pollQrcode, logout as apiLogout } from '../api'
+import { toast } from './useToast'
 
 /**
  * 登录状态与扫码登录 composable
@@ -95,9 +96,9 @@ export function useLogin() {
   }
 
   async function doLogout() {
-    if (!confirm('确定要退出登录吗？退出后只能拿到 3 条精选评论。')) return
     try {
       await apiLogout()
+      toast('B站已退出登录', 'success')
     } catch (_) { /* ignore */ }
     await refreshStatus()
   }

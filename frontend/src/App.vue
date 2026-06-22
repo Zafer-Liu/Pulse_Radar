@@ -11,6 +11,7 @@
       @open-settings="settingsShow = true"
       @open-alert="alertShow = true"
       @logout="login.doLogout()"
+      @logout-xhs="doXhsLogout()"
     />
 
     <div class="wrap">
@@ -136,7 +137,7 @@ import EmptyState from './components/ui/EmptyState.vue'
 import { useLogin } from './composables/useLogin'
 import { useMonitors } from './composables/useMonitors'
 import { toast } from './composables/useToast'
-import { getAlertConfig, initAuth, apiGet } from './api'
+import { getAlertConfig, initAuth, apiGet, xhsLogout } from './api'
 
 const login = useLogin()
 const monitors = useMonitors()
@@ -157,6 +158,17 @@ async function loadXhsStatus() {
   } catch {
     xhsLoggedIn.value = false
   }
+}
+
+// 退出小红书登录
+async function doXhsLogout() {
+  try {
+    await xhsLogout()
+    toast('小红书已退出登录', 'success')
+  } catch (e) {
+    toast('退出小红书失败：' + (e.message || e), 'error')
+  }
+  await loadXhsStatus()
 }
 
 // 启动时检查告警配置状态（用于 TopBar 铃铛上的绿点）

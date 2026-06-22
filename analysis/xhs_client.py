@@ -237,8 +237,10 @@ def _request(
     for sign_attempt in range(2):
         try:
             signs = xhs_login._sign(sign_uri, post_body, a1=a1)
-            req_headers["X-s"] = signs["x-s"]
-            req_headers["X-t"] = signs["x-t"]
+            # 使用所有返回的签名字段（X-s, X-t, X-s-common 等）
+            for key, val in signs.items():
+                header_key = key.replace("x-", "X-") if key.startswith("x-") else key
+                req_headers[header_key] = val
             signed = True
             break
         except Exception as exc:
@@ -439,6 +441,83 @@ def resolve_note_id(raw_url: str) -> tuple[str, str, str]:
 # 笔记详情
 # ============================================================
 
+def _extract_initial_state(html: str) -> str | None:
+    """从 HTML 中提取 window.__INITIAL_STATE__ 的完整 JSON 字符串。
+
+    用括号匹配方式提取完整 JSON，避免正则非贪婪匹配在第一个 } 停止的问题。
+    小红书的 __INITIAL_STATE__ 可能包含嵌套对象，必须匹配所有括号。
+
+    Args:
+        html: HTML 页面内容
+
+    Returns:
+        JSON 字符串，如果未找到返回 None
+    """
+    # 找到 window.__INITIAL_STATE__= 的位置
+    marker = "window.__INITIAL_STATE__"
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+
+    # 找到 = 后面的第一个 {
+    start = html.find("{", idx)
+    if start == -1:
+        return None
+
+    # 用括号匹配找到完整的 JSON
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(html)):
+        ch = html[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start : i + 1]
+
+    return None
+
+
+def _clean_state_json(state_str: str) -> str:
+    """清理 __INITIAL_STATE__ 中的 JS 特殊值，使其成为合法 JSON。
+
+    小红书的 __INITIAL_STATE__ 不是标准 JSON，包含：
+    - undefined 作为值（应替换为 null）
+    - undefined 作为对象 key（应替换为 "undefined"）
+    - undefined 在数组中（应替换为 null）
+
+    简单的 replace("undefined", '""') 会导致 key 位置出错，
+    需要根据上下文分别处理。
+    """
+    import re
+
+    # 1. undefined 作为对象 key: {undefined: 或 ,undefined:
+    #    JS 中 {undefined: ...} 等价于 {"undefined": ...}
+    state_str = re.sub(r'([{,])\s*undefined\s*:', r'\1"undefined":', state_str)
+
+    # 2. undefined 作为值: :undefined
+    state_str = re.sub(r':\s*undefined\b', ': null', state_str)
+
+    # 3. undefined 在数组中: [undefined, 或 ,undefined]
+    state_str = re.sub(r'\[\s*undefined\b', '[null', state_str)
+    state_str = re.sub(r',\s*undefined([,\]])', r',null\1', state_str)
+
+    return state_str
+
+
 def fetch_note_info(
     note_id: str,
     xsec_token: str = "",
@@ -499,12 +578,13 @@ def fetch_note_info(
     _random_delay()
 
     # 从 HTML 中提取 window.__INITIAL_STATE__
-    match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*</script>", html)
-    if not match:
+    # 用括号匹配方式提取完整 JSON（正则非贪婪匹配会在第一个 } 停止，导致 JSON 不完整）
+    state_str = _extract_initial_state(html)
+    if not state_str:
         logger.error(f"未找到 __INITIAL_STATE__：note_id={note_id} HTML长度={len(html)}")
         raise RuntimeError(f"未找到 __INITIAL_STATE__: note_id={note_id}")
 
-    state_str = match.group(1).replace("undefined", '""')
+    state_str = _clean_state_json(state_str)
     state = json.loads(state_str)
     logger.info(f"fetch_note_info __INITIAL_STATE__ 解析成功")
 
@@ -809,6 +889,143 @@ def fetch_comments(
 # 搜索笔记
 # ============================================================
 
+def search_notes_via_html(
+    keyword: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> dict[str, Any]:
+    """通过搜索页面 HTML 提取搜索结果（绕过搜索 API 的账号风控）。
+
+    和 fetch_note_info 一样，用 urllib + Cookie 获取搜索页面 HTML，
+    从 __INITIAL_STATE__ 中提取搜索结果。
+    搜索 API (code=300011) 对账号风控更严格，但 HTML 页面不检查账号状态。
+
+    Args:
+        keyword: 搜索关键词
+        page: 页码（从 1 开始）
+        page_size: 每页数量（HTML 方式忽略此参数，返回页面初始加载的结果）
+
+    Returns:
+        搜索结果字典，格式与 search_notes 相同
+    """
+    import re
+    from urllib.parse import quote
+
+    # 搜索页面 URL
+    url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keyword)}&source=web_search_result_notes"
+
+    # 加载 Cookie
+    cookies = load_xhs_cookies()
+    cookie_str = _build_cookie_header(cookies)
+
+    # HTML 页面请求头
+    headers = {
+        "User-Agent": _UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cookie": cookie_str,
+        "Referer": "https://www.xiaohongshu.com/",
+    }
+
+    logger.info(f"search_notes_via_html: keyword={keyword} URL={url}")
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8")
+            logger.info(f"search_notes_via_html: HTML 获取成功，{len(html)} 字节")
+            break
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", errors="replace")
+            logger.warning(f"search_notes_via_html: HTTP {e.code} attempt={attempt}/3 body={body_text[:100]}")
+            if attempt == 3:
+                raise RuntimeError(f"获取搜索页面失败 HTTP {e.code}") from e
+            _random_delay()
+
+    _random_delay()
+
+    # 从 HTML 中提取 window.__INITIAL_STATE__
+    # 用括号匹配方式提取完整 JSON（正则非贪婪匹配会在第一个 } 停止，导致 JSON 不完整）
+    state_str = _extract_initial_state(html)
+    if not state_str:
+        logger.error(f"search_notes_via_html: 未找到 __INITIAL_STATE__，HTML 长度={len(html)}")
+        raise RuntimeError("搜索页面未找到 __INITIAL_STATE__")
+
+    state_str = _clean_state_json(state_str)
+    try:
+        state = json.loads(state_str)
+    except json.JSONDecodeError as je:
+        logger.error(f"search_notes_via_html: JSON 解析失败: {je}")
+        logger.error(f"search_notes_via_html: state_str 前 200 字符: {state_str[:200]}")
+        raise RuntimeError(f"搜索页面 __INITIAL_STATE__ JSON 解析失败: {je}")
+    logger.info(f"search_notes_via_html: __INITIAL_STATE__ 解析成功")
+
+    # 提取搜索结果
+    # 搜索结果在 state.search.notes 或 state.search.feeds 中
+    search_data = state.get("search", {})
+    logger.info(f"search_notes_via_html: search 键={list(search_data.keys()) if isinstance(search_data, dict) else type(search_data)}")
+
+    # 尝试多种可能的数据路径
+    raw_items = []
+    # 路径1: search.notes
+    if isinstance(search_data, dict):
+        raw_items = search_data.get("notes", []) or search_data.get("feeds", [])
+    # 路径2: search.searchNotes.notes
+    if not raw_items and isinstance(search_data, dict):
+        search_notes_data = search_data.get("searchNotes", {})
+        if isinstance(search_notes_data, dict):
+            raw_items = search_notes_data.get("notes", []) or search_notes_data.get("feeds", [])
+
+    logger.info(f"search_notes_via_html: 原始搜索结果 {len(raw_items)} 条")
+
+    # 转换为标准格式
+    results = []
+    for item in raw_items:
+        # 搜索结果可能是 note_card 或直接是 note 对象
+        note = item.get("note_card", item) if isinstance(item, dict) else {}
+        if not note:
+            continue
+
+        user_info = note.get("user", {})
+        interact = note.get("interact_info", note.get("interactInfo", {}))
+
+        note_type = note.get("type", "normal")
+        type_str = "video" if note_type == "video" else "image"
+
+        note_id = note.get("note_id", note.get("id", note.get("noteId", "")))
+        if not note_id:
+            continue
+
+        results.append({
+            "id": note_id,
+            "title": note.get("title", note.get("display_title", "")),
+            "desc": note.get("desc", note.get("display_desc", ""))[:100] if note.get("desc") or note.get("display_desc") else "",
+            "type": type_str,
+            "user": {
+                "userId": user_info.get("user_id", user_info.get("userId", "")),
+                "nickname": user_info.get("nickname", user_info.get("nick_name", "")),
+                "avatar": user_info.get("avatar", ""),
+            },
+            "interactInfo": {
+                "likes": interact.get("liked_count", interact.get("likedCount", "0")),
+                "commentCount": interact.get("comment_count", interact.get("commentCount", "0")),
+            },
+            "xsecToken": note.get("xsec_token", note.get("xsecToken", "")),
+            "time": note.get("time", 0),
+        })
+
+    result = {
+        "keyword": keyword,
+        "page": page,
+        "total": len(results),  # HTML 方式无法获取总搜索数
+        "results": results,
+    }
+
+    logger.info(f"search_notes_via_html: 搜索完成 keyword={keyword} results={len(results)}")
+    return result
+
+
 def search_notes(
     keyword: str,
     page: int = 1,
@@ -817,7 +1034,11 @@ def search_notes(
 ) -> dict[str, Any]:
     """搜索小红书笔记。
 
-    API: POST /api/sns/web/v1/search/notes
+    策略（按优先级）：
+    1. 优先用 HTML 方式（search_notes_via_html），绕过搜索 API 的账号风控
+       → 和 fetch_note_info 一样用 urllib 获取搜索页面 HTML
+    2. 如果 HTML 方式失败，回退到浏览器 fetch（自动签名+Cookie）
+    3. 如果浏览器 fetch 也失败，回退到 _request（带 Playwright 签名）
 
     Args:
         keyword: 搜索关键词
@@ -838,12 +1059,87 @@ def search_notes(
         "note_type": 0,
     }
 
-    data = _request(url, method="POST", body=body)
+    logger.info(f"search_notes: keyword={keyword} page={page} page_size={page_size}")
+
+    # ============================================================
+    # 阶段1：优先用 HTML 方式（最可靠，绕过账号风控）
+    # ============================================================
+    try:
+        logger.info("search_notes: 尝试 HTML 方式...")
+        result = search_notes_via_html(keyword, page, page_size)
+        if result.get("results"):
+            logger.info(f"search_notes: HTML 方式成功，{len(result['results'])} 条结果")
+            return result
+        logger.warning("search_notes: HTML 方式返回空结果，尝试 Playwright DOM 方式")
+    except Exception as html_exc:
+        logger.warning(f"search_notes: HTML 方式失败: {html_exc}")
+
+    # ============================================================
+    # 阶段1.5：Playwright DOM 提取搜索结果（绕过搜索 API 风控）
+    # ============================================================
+    if xhs_login.is_available():
+        try:
+            logger.info("search_notes: 尝试 Playwright DOM 提取搜索结果...")
+            dom_result = xhs_login.extract_search_results(keyword)
+            dom_results = dom_result.get("results", [])
+            dbg = dom_result.get("debug", {})
+            logger.info(f"search_notes: Playwright DOM 提取结果: {len(dom_results)} 条, page={dbg.get('title', '?')}")
+            if dom_results:
+                result = {
+                    "keyword": keyword,
+                    "page": page,
+                    "total": len(dom_results),
+                    "results": dom_results,
+                }
+                logger.info(f"search_notes: Playwright DOM 方式成功，{len(dom_results)} 条结果")
+                return result
+            logger.warning("search_notes: Playwright DOM 方式返回空结果，尝试 API 方式")
+        except Exception as dom_exc:
+            logger.warning(f"search_notes: Playwright DOM 方式失败: {dom_exc}")
+
+    # ============================================================
+    # 阶段2：浏览器 fetch（自动签名+Cookie）
+    # ============================================================
+    data = None
+    if xhs_login.is_available():
+        try:
+            logger.info("search_notes: 尝试浏览器 fetch...")
+            fetch_result = xhs_login.fetch_via_browser(url, method="POST", body=body)
+            status = fetch_result.get("status")
+            body_text = fetch_result.get("body", "")
+            logger.info(f"search_notes: 浏览器 fetch 返回 status={status}, body 长度={len(body_text)}")
+            logger.info(f"search_notes: 浏览器 fetch body 前 500 字符: {body_text[:500]}")
+            if status == 200:
+                try:
+                    data = json.loads(body_text)
+                    logger.info(f"search_notes: JSON 解析成功, code={data.get('code')}, msg={data.get('msg')}")
+                except json.JSONDecodeError as je:
+                    logger.warning(f"搜索浏览器 fetch 返回非 JSON: {je}, body={body_text[:200]}")
+            else:
+                logger.warning(f"搜索浏览器 fetch 返回 {status}: {body_text[:200]}")
+        except Exception as fetch_exc:
+            logger.warning(f"搜索浏览器 fetch 异常: {fetch_exc}", exc_info=True)
+    else:
+        logger.warning("search_notes: xhs_login 不可用")
+
+    # ============================================================
+    # 阶段3：_request（带 Playwright 签名）
+    # ============================================================
+    if data is None:
+        try:
+            logger.info("search_notes: 尝试 _request...")
+            data = _request(url, method="POST", body=body)
+            logger.info(f"search_notes: _request 返回 code={data.get('code')}, msg={data.get('msg')}")
+        except Exception as req_exc:
+            logger.error(f"搜索 _request 也失败: {req_exc}", exc_info=True)
+            raise RuntimeError(f"搜索笔记失败: {req_exc}") from req_exc
+
     _random_delay()
 
     if data.get("code") != 0 or "data" not in data:
         error_msg = data.get("msg", "未知错误")
-        logger.error(f"搜索笔记失败: {error_msg}")
+        logger.error(f"搜索笔记失败: {error_msg} (code={data.get('code')})")
+        logger.error(f"搜索笔记失败: 完整响应={json.dumps(data, ensure_ascii=False)[:500]}")
         raise RuntimeError(f"搜索笔记失败: {error_msg}")
 
     items = data["data"].get("items", [])

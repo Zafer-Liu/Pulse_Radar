@@ -1594,6 +1594,8 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
                 "title": title,
                 "author": note.get("user", {}).get("nickname", ""),
                 "platform": "小红书",
+                "pic": (ni.get("imageList") or [{}])[0].get("url", "") if ni.get("imageList") else "",
+                "noteUrl": f"https://www.xiaohongshu.com/explore/{note_id}",
                 "commentCount": len(comments),
                 "sentiments": sent_pct,
                 "sentimentCounts": dict(dist),
@@ -1609,6 +1611,7 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
                 "title": title,
                 "author": note.get("user", {}).get("nickname", ""),
                 "platform": "小红书",
+                "noteUrl": f"https://www.xiaohongshu.com/explore/{note_id}",
                 "commentCount": 0,
                 "error": str(exc),
             })

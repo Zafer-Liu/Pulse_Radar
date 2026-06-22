@@ -354,10 +354,13 @@ def _worker_loop():
                         "([url, data]) => window._webmsxyw(url, data)",
                         [uri, data],
                     )
-                    result = {
-                        "x-s": encrypt_params["X-s"],
-                        "x-t": str(encrypt_params["X-t"]),
-                    }
+                    # _webmsxyw 返回 {X-s, X-t, X-s-common, ...}
+                    # 把所有字段都返回，调用方按需使用
+                    result = {}
+                    for key, val in encrypt_params.items():
+                        if val is not None:
+                            # 转为小写 header 格式：X-s -> x-s, X-t -> x-t
+                            result[key.lower()] = str(val)
                     _result_queue.put({"ok": True, "signs": result})
                 except Exception as e:
                     logger.warning(f"签名失败: {e}")
@@ -536,6 +539,174 @@ def _worker_loop():
                         except Exception:
                             pass
 
+            elif cmd_type == "navigate_and_extract_search":
+                # 导航到搜索页面，等待搜索结果加载，从 DOM 和 __INITIAL_STATE__ 提取
+                # 搜索页面和笔记页面不同，通常不会被风控
+                keyword = cmd[1]
+                search_page = None
+                try:
+                    from urllib.parse import quote
+                    search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keyword)}&source=web_search_result_notes"
+                    search_page = context.new_page()
+                    # 用 domcontentloaded 而非 networkidle，搜索页面有持续网络请求，
+                    # networkidle 会永远超时
+                    search_page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                    current_url = search_page.url
+                    logger.info(f"搜索页面导航完成: {current_url}")
+
+                    # 检测是否被重定向到登录页
+                    if "/login" in current_url or "redirectPath" in current_url:
+                        logger.warning(f"搜索页面被重定向到登录页: {current_url}")
+                        _result_queue.put({
+                            "ok": True,
+                            "result": {"results": [], "loginRedirect": True},
+                        })
+                        continue
+
+                    # 等待搜索结果加载（等待特定元素出现，最多等 15 秒）
+                    try:
+                        search_page.wait_for_selector(
+                            ".note-item, [class*='NoteCard'], [class*='note-item'], a[href*='/explore/'], .feeds-container, .search-result",
+                            timeout=15000,
+                        )
+                        logger.info("搜索页面结果元素已出现")
+                    except Exception:
+                        logger.warning("搜索页面未检测到结果元素，继续尝试提取")
+
+                    # 额外等待确保数据加载
+                    time.sleep(2)
+                    # 滚动加载更多
+                    for _ in range(2):
+                        try:
+                            search_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        except Exception:
+                            pass
+                        time.sleep(1)
+
+                    # 从 DOM 和 __INITIAL_STATE__ 提取搜索结果
+                    js_extract_search = """
+                    () => {
+                        const results = [];
+
+                        // 方法1：从 __INITIAL_STATE__ 提取（最可靠）
+                        try {
+                            const state = window.__INITIAL_STATE__;
+                            if (state) {
+                                // 搜索结果可能在多个位置
+                                let searchNotes = null;
+                                if (state.search) {
+                                    if (state.search.notes) searchNotes = state.search.notes;
+                                    else if (state.search.feeds) searchNotes = state.search.feeds;
+                                    else if (state.search.searchNotes) {
+                                        searchNotes = state.search.searchNotes.notes || state.search.searchNotes.feeds;
+                                    }
+                                }
+                                if (searchNotes && Array.isArray(searchNotes)) {
+                                    searchNotes.forEach(item => {
+                                        const note = item.note_card || item.model_type ? item : (item.note || item);
+                                        if (!note) return;
+                                        const noteId = note.note_id || note.id || note.noteId || '';
+                                        if (!noteId) return;
+                                        const user = note.user || {};
+                                        const interact = note.interact_info || note.interactInfo || {};
+                                        results.push({
+                                            id: noteId,
+                                            title: note.title || note.display_title || '',
+                                            desc: (note.desc || note.display_desc || '').substring(0, 100),
+                                            type: note.type === 'video' ? 'video' : 'image',
+                                            user: {
+                                                userId: user.user_id || user.userId || '',
+                                                nickname: user.nickname || user.nick_name || '',
+                                                avatar: user.avatar || '',
+                                            },
+                                            interactInfo: {
+                                                likes: interact.liked_count || interact.likedCount || '0',
+                                                commentCount: interact.comment_count || interact.commentCount || '0',
+                                            },
+                                            xsecToken: note.xsec_token || note.xsecToken || '',
+                                            time: note.time || 0,
+                                        });
+                                    });
+                                }
+                            }
+                        } catch(e) {
+                            console.log('extract from state error:', e);
+                        }
+
+                        // 方法2：从 DOM 提取（备选）
+                        if (results.length === 0) {
+                            const selectors = [
+                                '.note-item',
+                                '[class*="NoteCard"]',
+                                '[class*="note-item"]',
+                                '.search-result-item',
+                                'section.note-item',
+                                'a[href*="/explore/"]',
+                            ];
+                            let items = [];
+                            for (const sel of selectors) {
+                                items = document.querySelectorAll(sel);
+                                if (items.length > 0) break;
+                            }
+                            items.forEach(item => {
+                                try {
+                                    const linkEl = item.querySelector('a[href*="/explore/"]') || item;
+                                    const href = linkEl.href || '';
+                                    const noteIdMatch = href.match(/\\/explore\\/([a-f0-9]+)/);
+                                    const noteId = noteIdMatch ? noteIdMatch[1] : '';
+                                    if (!noteId) return;
+                                    const titleEl = item.querySelector('.title, [class*="title"], .note-title, .desc');
+                                    const authorEl = item.querySelector('.author, .name, [class*="author"], [class*="name"]');
+                                    const likeEl = item.querySelector('.like-wrapper .count, [class*="like"] [class*="count"]');
+                                    results.push({
+                                        id: noteId,
+                                        title: titleEl ? titleEl.textContent.trim() : '',
+                                        desc: '',
+                                        type: 'image',
+                                        user: {
+                                            userId: '',
+                                            nickname: authorEl ? authorEl.textContent.trim() : '',
+                                            avatar: '',
+                                        },
+                                        interactInfo: {
+                                            likes: likeEl ? likeEl.textContent.trim() : '0',
+                                            commentCount: '0',
+                                        },
+                                        xsecToken: '',
+                                        time: 0,
+                                    });
+                                } catch(e) {}
+                            });
+                        }
+
+                        return {
+                            results: results,
+                            debug: {
+                                title: document.title,
+                                url: window.location.href,
+                                bodyLength: document.body.innerHTML.length,
+                            },
+                        };
+                    }
+                    """
+                    result = search_page.evaluate(js_extract_search)
+                    dbg = result.get("debug", {})
+                    results = result.get("results", [])
+                    logger.info(
+                        f"搜索结果提取: results={len(results)}, "
+                        f"page={dbg.get('title', '?')}, bodyLen={dbg.get('bodyLength', 0)}"
+                    )
+                    _result_queue.put({"ok": True, "result": result})
+                except Exception as e:
+                    logger.warning(f"navigate_and_extract_search 失败: {e}")
+                    _result_queue.put({"ok": False, "error": str(e)})
+                finally:
+                    if search_page:
+                        try:
+                            search_page.close()
+                        except Exception:
+                            pass
+
             elif cmd_type == "navigate_and_fetch":
                 # 先导航到页面，再在页面上下文中调用 API
                 nav_url = cmd[1]
@@ -571,20 +742,29 @@ def _worker_loop():
                 fetch_method = cmd[2] if len(cmd) > 2 else "GET"
                 fetch_body = cmd[3] if len(cmd) > 3 else None
                 try:
+                    logger.info(f"浏览器 fetch 开始: method={fetch_method} url={fetch_url}")
+                    if fetch_body:
+                        logger.info(f"浏览器 fetch body: {fetch_body}")
                     # 使用 window._webmsxyw() 生成签名，然后带签名发起 fetch
                     # 这样一个命令就完成签名+请求，避免签名队列超时
                     js_code = """
                     async ([url, method, body]) => {
                         // 生成签名
                         let signData = null;
+                        let signKeys = [];
                         try {
                             const path = new URL(url).pathname + new URL(url).search;
                             const webmsxyw = window._webmsxyw;
                             if (webmsxyw) {
                                 signData = webmsxyw(path, method === 'POST' ? body : undefined);
+                                if (signData) {
+                                    signKeys = Object.keys(signData);
+                                }
+                            } else {
+                                return { status: -1, body: 'ERROR: window._webmsxyw not found' };
                             }
                         } catch(e) {
-                            console.log('sign error:', e);
+                            return { status: -2, body: 'ERROR sign: ' + e.message };
                         }
 
                         const opts = {
@@ -595,23 +775,35 @@ def _worker_loop():
                                 'Content-Type': 'application/json',
                             }
                         };
-                        // 添加签名头
+                        // 添加签名头（X-s, X-t, X-s-common 等）
                         if (signData) {
-                            opts.headers['X-s'] = signData['X-s'];
-                            opts.headers['X-t'] = String(signData['X-t']);
+                            // _webmsxyw 返回 {X-s, X-t, X-s-common, ...}
+                            // 把所有字段都添加到请求头
+                            for (const key in signData) {
+                                if (signData[key] != null) {
+                                    opts.headers[key] = String(signData[key]);
+                                }
+                            }
                         }
                         if (body && method === 'POST') {
                             opts.body = JSON.stringify(body);
                         }
-                        const resp = await fetch(url, opts);
-                        const text = await resp.text();
-                        return { status: resp.status, body: text };
+                        try {
+                            const resp = await fetch(url, opts);
+                            const text = await resp.text();
+                            return { status: resp.status, body: text, signKeys: signKeys };
+                        } catch(e) {
+                            return { status: -3, body: 'ERROR fetch: ' + e.message, signKeys: signKeys };
+                        }
                     }
                     """
                     result = page.evaluate(js_code, [fetch_url, fetch_method, fetch_body])
+                    sign_keys = result.get("signKeys", []) if isinstance(result, dict) else []
+                    logger.info(f"浏览器 fetch 签名字段: {sign_keys}")
+                    logger.info(f"浏览器 fetch 结果: status={result.get('status')}, body 长度={len(result.get('body', ''))}")
                     _result_queue.put({"ok": True, "result": result})
                 except Exception as e:
-                    logger.warning(f"浏览器 fetch 失败: {e}")
+                    logger.warning(f"浏览器 fetch 失败: {e}", exc_info=True)
                     _result_queue.put({"ok": False, "error": str(e)})
 
     except Exception as e:
@@ -785,6 +977,31 @@ def extract_comments_from_page(note_url: str) -> dict:
         raise RuntimeError(f"提取评论失败: {result.get('error', '未知错误')}")
     except queue.Empty:
         raise RuntimeError("提取评论超时")
+
+
+def extract_search_results(keyword: str) -> dict:
+    """导航到搜索页面，等待搜索结果加载，从 DOM 和 __INITIAL_STATE__ 提取搜索结果。
+
+    搜索页面和笔记页面不同，通常不会被风控。
+    这是对搜索 API 被风控（code=-104/-300011）时的备选方案。
+
+    Args:
+        keyword: 搜索关键词
+
+    Returns:
+        {"results": list, "debug": dict}
+    """
+    if not _ensure_worker():
+        raise RuntimeError("签名服务不可用（Playwright 未安装或启动失败）")
+
+    _cmd_queue.put(("navigate_and_extract_search", keyword))
+    try:
+        result = _result_queue.get(timeout=60)
+        if result.get("ok"):
+            return result["result"]
+        raise RuntimeError(f"提取搜索结果失败: {result.get('error', '未知错误')}")
+    except queue.Empty:
+        raise RuntimeError("提取搜索结果超时")
 
 
 def is_available() -> bool:
