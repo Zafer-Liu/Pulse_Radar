@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -128,10 +129,42 @@ def _build_prompt(video: dict[str, Any], comments: list[dict[str, Any]],
     return prompt
 
 
-def _call_llm(prompt: str) -> str | None:
-    """调用 OpenAI 兼容 API，返回文本响应。失败返回 None。"""
+def _classify_http_error(status: int, body: str) -> str:
+    """根据 HTTP 状态码 + 响应体判断降级原因。
+
+    返回值与前端约定的 degrade_reason 一致：
+        auth_failed          —— API key 无效 / 鉴权失败
+        insufficient_balance —— 余额不足 / 配额耗尽
+        rate_limited         —— 触发限流
+        api_error            —— 其他 API 错误
+    """
+    low = (body or "").lower()
+    balance_hints = ("insufficient", "quota", "balance", "余额", "欠费", "arrears", "exceeded your current quota")
+    if status in (401, 403):
+        # 部分服务商把余额耗尽也返回 403，需结合 body 判断
+        if any(h in low for h in balance_hints):
+            return "insufficient_balance"
+        return "auth_failed"
+    if status in (402,):
+        return "insufficient_balance"
+    if status == 429:
+        # 429 既可能是限流也可能是配额耗尽
+        if any(h in low for h in balance_hints):
+            return "insufficient_balance"
+        return "rate_limited"
+    return "api_error"
+
+
+def _call_llm(prompt: str) -> tuple[str | None, str | None]:
+    """调用 OpenAI 兼容 API。
+
+    Returns:
+        (content, error_reason)
+        - 成功：(响应文本, None)
+        - 失败：(None, degrade_reason)，reason 取值见 _classify_http_error
+    """
     if not API_KEY:
-        return None
+        return None, "no_key"
     payload = {
         "model": MODEL,
         "messages": [
@@ -157,10 +190,18 @@ def _call_llm(prompt: str) -> str | None:
             data = json.loads(resp.read().decode("utf-8"))
         content = data["choices"][0]["message"]["content"]
         logger.info(f"LLM 调用成功，模型={MODEL}，响应 {len(content)} 字符")
-        return content
+        return content, None
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", "ignore")
+        except Exception:
+            err_body = ""
+        reason = _classify_http_error(exc.code, err_body)
+        logger.warning(f"LLM 调用失败 HTTP {exc.code}（{reason}），降级为模板报告：{err_body[:200]}")
+        return None, reason
     except Exception as exc:
-        logger.warning(f"LLM 调用失败，将降级为模板报告：{exc}")
-        return None
+        logger.warning(f"LLM 调用失败（网络/超时），降级为模板报告：{exc}")
+        return None, "api_error"
 
 
 def _parse_llm_json(content: str) -> dict[str, Any] | None:
@@ -266,8 +307,18 @@ def _parse_llm_json(content: str) -> dict[str, Any] | None:
 
 
 def _template_report(video: dict[str, Any], comments: list[dict[str, Any]],
-                     dist: dict[str, int], keywords: list[str]) -> dict[str, Any]:
-    """模板报告（降级路径，与原 make_report 逻辑一致）。"""
+                     dist: dict[str, int], keywords: list[str],
+                     degrade_reason: str = "no_key") -> dict[str, Any]:
+    """模板报告（降级路径，与原 make_report 逻辑一致）。
+
+    degrade_reason 标记降级原因，供前端弹窗提示：
+        no_key               —— 未配置 API key
+        insufficient_balance —— 余额不足 / 配额耗尽
+        auth_failed          —— key 无效 / 鉴权失败
+        rate_limited         —— 触发限流
+        api_error            —— 其他调用失败（网络/超时/解析）
+        empty                —— 评论为空，无需调用 LLM
+    """
     total = len(comments)
     title = video.get("title", "该视频")
     top_keywords = "、".join(keywords[:6]) if keywords else "暂无明显高频词"
@@ -283,6 +334,7 @@ def _template_report(video: dict[str, Any], comments: list[dict[str, Any]],
             "suggestion": "建议换用浏览器已登录环境或减少请求频率后重试。",
             "ai_generated": False,
             "model": "template",
+            "degrade_reason": "empty",
         }
 
     summary = (
@@ -298,6 +350,7 @@ def _template_report(video: dict[str, Any], comments: list[dict[str, Any]],
         "suggestion": "建议优先人工复核高赞负面评论和风险评论；如果用于正式汇报，可增加人工标注或接入更强的情感分类模型。",
         "ai_generated": False,
         "model": "template",
+        "degrade_reason": degrade_reason,
     }
 
 
@@ -312,11 +365,11 @@ def generate_report(video: dict[str, Any], comments: list[dict[str, Any]],
     """
     # 无 API key -> 直接模板
     if not API_KEY:
-        return _template_report(video, comments, dist, keywords)
+        return _template_report(video, comments, dist, keywords, "no_key")
 
     # 评论为空 -> 直接模板（LLM 无米下锅）
     if not comments:
-        return _template_report(video, comments, dist, keywords)
+        return _template_report(video, comments, dist, keywords, "empty")
 
     # === 优先 Agent 模式 ===
     try:
@@ -334,7 +387,7 @@ def generate_report(video: dict[str, Any], comments: list[dict[str, Any]],
     # 构造 prompt + 调用 LLM
     prompt = _build_prompt(video, comments, dist, keywords, clusters)
     logger.info(f"LLM prompt 构造完成，{len(prompt)} 字符")
-    content = _call_llm(prompt)
+    content, error_reason = _call_llm(prompt)
 
     if content:
         parsed = _parse_llm_json(content)
@@ -343,7 +396,9 @@ def generate_report(video: dict[str, Any], comments: list[dict[str, Any]],
             parsed["model"] = MODEL
             logger.info("LLM 报告生成成功")
             return parsed
+        # 调用成功但解析失败，归类为 api_error
+        error_reason = "api_error"
 
-    # 降级
-    logger.info("LLM 不可用或解析失败，降级为模板报告")
-    return _template_report(video, comments, dist, keywords)
+    # 降级：带上具体原因
+    logger.info(f"LLM 不可用或解析失败（{error_reason}），降级为模板报告")
+    return _template_report(video, comments, dist, keywords, error_reason or "api_error")

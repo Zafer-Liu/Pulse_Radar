@@ -529,6 +529,16 @@ def run(
             # 解析最终 JSON
             result = _parse_final_response(content)
             if result:
+                # 追加一条"结论"轨迹步，让前端能呈现完整的 思考→查证→修正→结论 闭环
+                conclusion_thought = result.get("summary", "") or "综合多轮查证，形成最终舆情判断。"
+                trace.append({
+                    "round": round_num,
+                    "thought": conclusion_thought[:500],
+                    "action": "得出结论",
+                    "tool": "conclusion",
+                    "observation": "已综合上述查证结果，生成最终舆情分析报告与行动建议。",
+                    "isConclusion": True,
+                })
                 # 补充 actions 默认值
                 result.setdefault("actions", [])
                 result["ai_generated"] = True
@@ -558,9 +568,10 @@ def run(
             # 记录轨迹
             trace.append({
                 "round": round_num,
-                "thought": msg.get("content", "")[:200] if msg.get("content") else "",
-                "action": f"{tool_name}({json.dumps(args, ensure_ascii=False)[:100]})",
-                "observation": observation[:300],
+                "thought": msg.get("content", "")[:500] if msg.get("content") else "",
+                "action": f"{tool_name}({json.dumps(args, ensure_ascii=False)[:160]})",
+                "tool": tool_name,
+                "observation": observation[:600],
             })
 
             # 将工具结果回喂
