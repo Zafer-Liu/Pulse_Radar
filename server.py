@@ -32,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
+from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -1417,6 +1418,7 @@ def analyze_topic(
             stat = video_info.get("stat") or {}
             owner = video_info.get("owner") or {}
 
+            public_comment_count = int(stat.get("reply", 0) or 0)
             video_analysis = {
                 "bvid": bvid,
                 "title": video_info.get("title"),
@@ -1428,8 +1430,10 @@ def analyze_topic(
                 "coins": stat.get("coin", 0),
                 "favorites": stat.get("favorite", 0),
                 "danmaku": stat.get("danmaku", 0),
-                "replyCountFromVideo": int(stat.get("reply", 0) or 0),
+                "replyCountFromVideo": public_comment_count,
+                "publicCommentCount": public_comment_count,
                 "commentCount": len(replies),
+                "needsLogin": len(replies) <= 3 and public_comment_count > 15,
                 "risk": risk,
                 "riskReason": reason,
                 "sentiments": sentiment_percent,
@@ -1466,6 +1470,7 @@ def analyze_topic(
     agg_keywords = extract_keywords(all_comments, topn=15)
     agg_keywords_weighted = extract_keywords_weighted(all_comments, topn=15)
     agg_clusters = build_clusters(all_comments)
+    negative_timeline = _build_negative_timeline(all_comments)
 
     # LLM 增强情感分析
     llm_sentiment_stats = {"total_neutral": 0, "enhanced": 0, "unchanged": 0}
@@ -1486,10 +1491,12 @@ def analyze_topic(
     # 话题整体报告
     topic_report = _make_topic_report(keyword, video_analyses, all_comments, agg_sentiments, agg_keywords)
 
-    return {
+    result = {
         "type": "topic",
+        "platform": "B站",
         "keyword": keyword,
         "searchTotal": search_result["numResults"],
+        "requestedCount": min(top_n, len(videos)),
         "analyzedCount": len(video_analyses),
         "totalComments": len(all_comments),
         "videos": video_analyses,
@@ -1500,12 +1507,283 @@ def analyze_topic(
         "keywords": agg_keywords,
         "keywordsWeighted": agg_keywords_weighted,
         "clusters": agg_clusters,
+        "negativeTimeline": negative_timeline,
         "comments": sorted(all_comments, key=lambda x: x.get("likes", 0), reverse=True)[:50],
         "report": topic_report,
         "llmSentimentEnhanced": _LLM_SENTIMENT_OK,
         "llmSentimentStats": llm_sentiment_stats,
         "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    return _enrich_topic_meta(result)
+
+
+def _neg_ratio(sentiments: dict[str, Any]) -> float:
+    """负面占比口径：负面 + 风险（与 risk_level 一致）。sentiments 为百分比 dict。"""
+    if not sentiments:
+        return 0.0
+    return round(float(sentiments.get("neg", 0) or 0) + float(sentiments.get("risk", 0) or 0), 1)
+
+
+def _pick_compare_words(platform_data: dict[str, Any], limit: int = 6) -> list[str]:
+    words: list[str] = []
+    for item in (platform_data.get("keywordsWeighted") or []):
+        word = item.get("word") if isinstance(item, dict) else item
+        word = str(word or "").strip()
+        if len(word) >= 2 and word not in words:
+            words.append(word)
+    for word in (platform_data.get("keywords") or []):
+        word = str(word or "").strip()
+        if len(word) >= 2 and word not in words:
+            words.append(word)
+    return words[:limit]
+
+
+def _pick_compare_topics(platform_data: dict[str, Any], limit: int = 4, risky_only: bool = False) -> list[str]:
+    topics: list[str] = []
+    risky_labels = {"neg", "risk", "con"}
+    for cluster in (platform_data.get("clusters") or []):
+        if not isinstance(cluster, dict):
+            continue
+        if risky_only and cluster.get("sentiment") not in risky_labels:
+            continue
+        topic = str(cluster.get("topic") or "").strip()
+        if not topic or topic == "其他讨论" or topic in topics:
+            continue
+        topics.append(topic)
+        if len(topics) >= limit:
+            break
+    return topics
+
+
+def _describe_platform_tone(platform_label: str, platform_data: dict[str, Any]) -> dict[str, Any]:
+    sentiments = platform_data.get("sentiments") or {}
+    pos = float(sentiments.get("pos", 0) or 0)
+    neu = float(sentiments.get("neu", 0) or 0)
+    con = float(sentiments.get("con", 0) or 0)
+    risk = float(sentiments.get("risk", 0) or 0)
+    neg_ratio = _neg_ratio(sentiments)
+    topics = _pick_compare_topics(platform_data, limit=2)
+    words = _pick_compare_words(platform_data, limit=4)
+
+    if neg_ratio >= 35 or risk >= 8 or con >= 18:
+        tone = "争议密集"
+        summary = f"{platform_label}侧负面/风险合计 {neg_ratio}% ，讨论更容易围绕争议点继续发酵。"
+    elif pos >= 45 and neg_ratio <= 18:
+        tone = "种草导向"
+        summary = f"{platform_label}侧正面表达占优，更偏体验分享、推荐与安利。"
+    elif neu >= 40 and neg_ratio < 25:
+        tone = "理性讨论"
+        summary = f"{platform_label}侧中性信息占比更高，用户更偏分析、比较与判断。"
+    else:
+        tone = "情绪表达"
+        summary = f"{platform_label}侧情绪表达更直接，评论区更容易出现态度化发言。"
+
+    if topics:
+        summary += f" 话题集中在「{'」「'.join(topics)}」。"
+    elif words:
+        summary += f" 高频词集中在「{'」「'.join(words[:3])}」。"
+
+    return {
+        "tone": tone,
+        "summary": summary,
+        "topics": topics,
+        "keywords": words,
+    }
+
+
+def _build_compare_diff(bili: dict[str, Any] | None, xhs: dict[str, Any] | None) -> dict[str, Any]:
+    """计算两平台对比差异，并输出可直接展示的结构化解释。"""
+    diff: dict[str, Any] = {
+        "bothOk": bool(bili and xhs),
+    }
+    if not (bili and xhs):
+        return diff
+
+    sent_order = ["pos", "neu", "neg", "con", "risk"]
+    b_sent = bili.get("sentiments", {}) or {}
+    x_sent = xhs.get("sentiments", {}) or {}
+    diff["sentimentDelta"] = {k: round(float(b_sent.get(k, 0) or 0) - float(x_sent.get(k, 0) or 0), 1) for k in sent_order}
+
+    b_neg = _neg_ratio(b_sent)
+    x_neg = _neg_ratio(x_sent)
+    diff["biliNegRatio"] = b_neg
+    diff["xhsNegRatio"] = x_neg
+    diff["negRatioDiff"] = round(abs(b_neg - x_neg), 1)
+    if b_neg > x_neg:
+        diff["moreNegativePlatform"] = "bilibili"
+    elif x_neg > b_neg:
+        diff["moreNegativePlatform"] = "xiaohongshu"
+    else:
+        diff["moreNegativePlatform"] = "equal"
+
+    b_pos = round(float(b_sent.get("pos", 0) or 0), 1)
+    x_pos = round(float(x_sent.get("pos", 0) or 0), 1)
+    diff["biliPosRatio"] = b_pos
+    diff["xhsPosRatio"] = x_pos
+    diff["posRatioDiff"] = round(abs(b_pos - x_pos), 1)
+    if b_pos > x_pos:
+        diff["morePositivePlatform"] = "bilibili"
+    elif x_pos > b_pos:
+        diff["morePositivePlatform"] = "xiaohongshu"
+    else:
+        diff["morePositivePlatform"] = "equal"
+
+    b_con = round(float(b_sent.get("con", 0) or 0) + float(b_sent.get("risk", 0) or 0), 1)
+    x_con = round(float(x_sent.get("con", 0) or 0) + float(x_sent.get("risk", 0) or 0), 1)
+    diff["biliControversyRatio"] = b_con
+    diff["xhsControversyRatio"] = x_con
+    diff["controversyDiff"] = round(abs(b_con - x_con), 1)
+    if b_con > x_con:
+        diff["moreControversialPlatform"] = "bilibili"
+    elif x_con > b_con:
+        diff["moreControversialPlatform"] = "xiaohongshu"
+    else:
+        diff["moreControversialPlatform"] = "equal"
+
+    b_kws = _pick_compare_words(bili, limit=12)
+    x_kws = _pick_compare_words(xhs, limit=12)
+    b_set, x_set = set(b_kws), set(x_kws)
+    diff["commonKeywords"] = [k for k in b_kws if k in x_set][:12]
+    diff["biliOnlyKeywords"] = [k for k in b_kws if k not in x_set][:12]
+    diff["xhsOnlyKeywords"] = [k for k in x_kws if k not in b_set][:12]
+
+    b_topics = _pick_compare_topics(bili, limit=6)
+    x_topics = _pick_compare_topics(xhs, limit=6)
+    b_topic_set, x_topic_set = set(b_topics), set(x_topics)
+    diff["commonTopics"] = [topic for topic in b_topics if topic in x_topic_set][:6]
+    diff["biliOnlyTopics"] = [topic for topic in b_topics if topic not in x_topic_set][:6]
+    diff["xhsOnlyTopics"] = [topic for topic in x_topics if topic not in b_topic_set][:6]
+
+    diff["biliRisk"] = bili.get("risk", "unknown")
+    diff["xhsRisk"] = xhs.get("risk", "unknown")
+
+    bili_tone = _describe_platform_tone("B站", bili)
+    xhs_tone = _describe_platform_tone("小红书", xhs)
+    diff["biliTone"] = bili_tone
+    diff["xhsTone"] = xhs_tone
+
+    shared_focus = diff["commonTopics"] or diff["commonKeywords"][:5]
+    bili_focus = diff["biliOnlyTopics"] or diff["biliOnlyKeywords"][:4]
+    xhs_focus = diff["xhsOnlyTopics"] or diff["xhsOnlyKeywords"][:4]
+    bili_risky_topics = _pick_compare_topics(bili, limit=3, risky_only=True)
+    xhs_risky_topics = _pick_compare_topics(xhs, limit=3, risky_only=True)
+
+    why: list[str] = []
+    actions: list[str] = []
+    if diff["moreNegativePlatform"] == "bilibili" and diff["negRatioDiff"] >= 5:
+        driver = bili_risky_topics[0] if bili_risky_topics else (bili_focus[0] if bili_focus else "平台独有讨论")
+        headline = f"B站更偏负面，主要由「{driver}」一类讨论把风险拉高。"
+        why.append(f"B站负面+风险占比 {b_neg}% ，比小红书高 {diff['negRatioDiff']} 个百分点。")
+        if bili_risky_topics:
+            why.append(f"B站的负面主要集中在「{'」「'.join(bili_risky_topics[:3])}」这几类话题。")
+        if bili_focus:
+            why.append(f"B站独有关注点偏向「{'」「'.join(bili_focus[:3])}」，说明争议更集中在这些点上。")
+        actions.append(f"优先复核 B站里与「{driver}」相关的高赞评论，判断是否已进入持续发酵。")
+    elif diff["moreNegativePlatform"] == "xiaohongshu" and diff["negRatioDiff"] >= 5:
+        driver = xhs_risky_topics[0] if xhs_risky_topics else (xhs_focus[0] if xhs_focus else "平台独有讨论")
+        headline = f"小红书更偏负面，主要由「{driver}」一类讨论把风险拉高。"
+        why.append(f"小红书负面+风险占比 {x_neg}% ，比 B站高 {diff['negRatioDiff']} 个百分点。")
+        if xhs_risky_topics:
+            why.append(f"小红书的负面主要集中在「{'」「'.join(xhs_risky_topics[:3])}」这几类话题。")
+        if xhs_focus:
+            why.append(f"小红书独有关注点偏向「{'」「'.join(xhs_focus[:3])}」，说明情绪更容易围绕这些点扩散。")
+        actions.append(f"优先复核小红书里与「{driver}」相关的高赞评论，确认是否需要先做回应或澄清。")
+    else:
+        headline = "双平台整体情绪接近，差异更多体现在表达方式和关注点。"
+        why.append(f"两平台负面+风险占比差仅 {diff['negRatioDiff']} 个百分点，整体态度没有明显断层。")
+        if shared_focus:
+            why.append(f"双方都在讨论「{'」「'.join(shared_focus[:4])}」，说明主议题是一致的。")
+        if bili_focus or xhs_focus:
+            why.append(
+                f"真正的分化来自平台独有焦点：B站更关注「{'」「'.join(bili_focus[:2]) if bili_focus else '暂无'}」，"
+                f"小红书更关注「{'」「'.join(xhs_focus[:2]) if xhs_focus else '暂无'}」。"
+            )
+        actions.append("先看双方共同热议点，再分别抽查平台独有关注点，能更快判断差异是议题差还是表达差。")
+
+    if diff["controversyDiff"] >= 6:
+        higher = "B站" if diff["moreControversialPlatform"] == "bilibili" else "小红书"
+        why.append(f"{higher} 的争议/风险表达更集中，说明该平台更容易把讨论推向对立或预警状态。")
+
+    if bili_tone["tone"] != xhs_tone["tone"]:
+        why.append(f"平台气质也不同：B站更像“{bili_tone['tone']}”，小红书更像“{xhs_tone['tone']}”。")
+
+    if shared_focus:
+        actions.append(f"共同热议点先盯「{'」「'.join(shared_focus[:3])}」，这是跨平台都在放大的主线。")
+    if diff["morePositivePlatform"] != "equal" and diff["posRatioDiff"] >= 5:
+        better = "B站" if diff["morePositivePlatform"] == "bilibili" else "小红书"
+        actions.append(f"{better} 的正向承接更强，可把该平台当成观察用户接受度和正反馈的参考面。")
+
+    diff["explanation"] = {
+        "headline": headline,
+        "why": why[:5],
+        "sharedFocus": shared_focus[:6],
+        "divergentFocus": {
+            "bilibili": bili_focus[:4],
+            "xiaohongshu": xhs_focus[:4],
+        },
+        "actions": actions[:4],
+    }
+
+    insights = [headline]
+    insights.extend(why[:3])
+    if shared_focus:
+        insights.append(f"共同热议：{'、'.join(shared_focus[:4])}。")
+    if bili_focus or xhs_focus:
+        insights.append(
+            f"平台分化点：B站看「{'、'.join(bili_focus[:3]) if bili_focus else '暂无'}」，"
+            f"小红书看「{'、'.join(xhs_focus[:3]) if xhs_focus else '暂无'}」。"
+        )
+    diff["insights"] = insights[:6]
+    return diff
+
+
+def analyze_topic_compare(keyword: str, top_n: int = 5, pages: int = 3) -> dict[str, Any]:
+    """双平台对比分析：同时拉取 B站 + 小红书同一话题，并排对比情绪/关键词/风险差异。
+
+    两个平台并行分析，任一平台失败不影响另一平台，失败信息记录在对应平台的 error 字段。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: dict[str, Any] = {"bilibili": None, "xiaohongshu": None}
+    errors: dict[str, str] = {}
+
+    def _run_bili():
+        try:
+            results["bilibili"] = analyze_topic(keyword, top_n=top_n, pages_per_video=pages)
+        except Exception as exc:
+            errors["bilibili"] = str(exc)
+            logger.warning(f"对比分析-B站失败：{exc}")
+
+    def _run_xhs():
+        try:
+            results["xiaohongshu"] = analyze_xhs_topic(keyword, top_n=top_n, pages_per_note=pages)
+        except Exception as exc:
+            errors["xiaohongshu"] = str(exc)
+            logger.warning(f"对比分析-小红书失败：{exc}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_run_bili)
+        f2 = pool.submit(_run_xhs)
+        f1.result()
+        f2.result()
+
+    bili = results["bilibili"]
+    xhs = results["xiaohongshu"]
+    if bili is None and xhs is None:
+        raise RuntimeError(
+            f"两个平台均分析失败。B站：{errors.get('bilibili', '未知')}；小红书：{errors.get('xiaohongshu', '未知')}"
+        )
+
+    result = {
+        "type": "compare",
+        "keyword": keyword,
+        "bilibili": bili,
+        "xiaohongshu": xhs,
+        "errors": errors,
+        "diff": _build_compare_diff(bili, xhs),
+        "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return _enrich_compare_meta(result)
 
 
 def _make_topic_report(
@@ -1566,6 +1844,13 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
     
     all_comments = []
     video_results = []
+    xhs_cookies = xhs_client.load_xhs_cookies() if xhs_client else {}
+    playwright_available = False
+    try:
+        from analysis.xhs_login import _sign  # noqa: F401
+        playwright_available = True
+    except Exception:
+        playwright_available = False
     
     for i, note in enumerate(notes[:top_n]):
         note_id = note["id"]
@@ -1589,6 +1874,17 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
             total = max(1, sum(dist.values()))
             sent_pct = {k: round(dist.get(k, 0) * 100 / total, 1) for k in ["pos", "neu", "neg", "con", "risk"]}
             
+            interact_info = ni.get("interactInfo") or {}
+            public_comment_count = int(interact_info.get("commentCount", 0) or 0)
+            needs_login = len(comments) == 0 or (len(comments) <= 5 and public_comment_count > 15)
+            login_hint_parts = []
+            if needs_login:
+                if not xhs_cookies.get("a1"):
+                    login_hint_parts.append("Cookie 未配置（缺少 a1/web_session），建议先登录小红书。")
+                elif not playwright_available:
+                    login_hint_parts.append("Playwright 签名依赖未安装，建议执行 playwright install chromium 后重试。")
+                else:
+                    login_hint_parts.append("Cookie 可能已过期，建议重新登录小红书。")
             video_results.append({
                 "noteId": note_id,
                 "title": title,
@@ -1597,6 +1893,11 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
                 "pic": (ni.get("imageList") or [{}])[0].get("url", "") if ni.get("imageList") else "",
                 "noteUrl": f"https://www.xiaohongshu.com/explore/{note_id}",
                 "commentCount": len(comments),
+                "replyCountFromNote": public_comment_count,
+                "publicCommentCount": public_comment_count,
+                "needsLogin": needs_login,
+                "playwrightMissing": not playwright_available,
+                "loginHint": "".join(login_hint_parts),
                 "sentiments": sent_pct,
                 "sentimentCounts": dict(dist),
                 "risk": risk_level(sent_pct, len(comments))[0],
@@ -1629,16 +1930,20 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
     keywords = extract_keywords(all_comments)
     keywords_weighted = extract_keywords_weighted(all_comments)
     clusters = build_clusters(all_comments)
+    negative_timeline = _build_negative_timeline(all_comments)
     hot_comments = sorted(all_comments, key=lambda x: x.get("likes", 0), reverse=True)[:50]
     
     report = _make_xhs_topic_report(keyword, video_results, sentiments, keywords, clusters)
     
-    return {
+    result = {
         "type": "xhs_topic",
+        "platform": "小红书",
         "keyword": keyword,
         "searchTotal": search_result.get("total", 0),
+        "requestedCount": min(top_n, len(notes)),
         "analyzedCount": len(video_results),
         "totalComments": len(all_comments),
+        "playwrightMissing": not playwright_available,
         "videos": video_results,
         "risk": risk,
         "riskReason": reason,
@@ -1647,10 +1952,12 @@ def analyze_xhs_topic(keyword: str, top_n: int = 5, pages_per_note: int = 3) -> 
         "keywords": keywords,
         "keywordsWeighted": keywords_weighted,
         "clusters": clusters,
+        "negativeTimeline": negative_timeline,
         "comments": hot_comments,
         "report": report,
         "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    return _enrich_topic_meta(result)
 
 
 def _make_xhs_topic_report(keyword, videos, sentiments, keywords, clusters):
@@ -1681,6 +1988,636 @@ def _make_xhs_topic_report(keyword, videos, sentiments, keywords, clusters):
             lines.append(f"- **{cl.get('topic', '')}**（{cl.get('size', 0)} 条，{cl.get('sentiment', '')}）")
     
     return "\n".join(lines)
+
+
+def _resolve_public_comment_count(result: dict[str, Any]) -> int:
+    for key in ("publicCommentCount", "replyCountFromVideo", "replyCountFromNote"):
+        value = result.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _calc_coverage_rate(result: dict[str, Any]) -> float | None:
+    public_count = _resolve_public_comment_count(result)
+    comment_count = int(result.get("commentCount", 0) or 0)
+    if public_count <= 0:
+        return 100.0 if comment_count > 0 else None
+    return round(min(100.0, comment_count * 100.0 / public_count), 1)
+
+
+def _parse_comment_ts(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        ts = int(value)
+        if ts > 10**12:
+            ts //= 1000
+        return ts if ts > 0 else None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,13}", text):
+        ts = int(text)
+        if ts > 10**12:
+            ts //= 1000
+        return ts if ts > 0 else None
+
+    normalized = text.replace("/", "-").replace("T", " ").replace("Z", "").strip()
+    if "." in normalized:
+        normalized = normalized.split(".", 1)[0]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(normalized, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def _pick_timeline_bucket(span_seconds: int) -> tuple[int, str, str]:
+    if span_seconds <= 6 * 3600:
+        return 1800, "%m-%d %H:%M", "30分钟"
+    if span_seconds <= 24 * 3600:
+        return 7200, "%m-%d %H:%M", "2小时"
+    if span_seconds <= 3 * 24 * 3600:
+        return 6 * 3600, "%m-%d %H:%M", "6小时"
+    if span_seconds <= 14 * 24 * 3600:
+        return 24 * 3600, "%m-%d", "天"
+    if span_seconds <= 90 * 24 * 3600:
+        return 7 * 24 * 3600, "%m-%d", "周"
+    return 30 * 24 * 3600, "%Y-%m", "月"
+
+
+def _describe_timeline_stage(negative_ratio: float, negative_count: int, risk_count: int) -> str:
+    if negative_count <= 0 and risk_count <= 0:
+        return "平稳"
+    if negative_ratio >= 45 or risk_count >= 3 or negative_count >= 8:
+        return "爆发"
+    if negative_ratio >= 28 or risk_count >= 1 or negative_count >= 4:
+        return "升温"
+    return "露头"
+
+
+def _timeline_terms(comments: list[dict[str, Any]], topn: int = 3) -> list[str]:
+    if not comments:
+        return []
+    weighted = extract_keywords_weighted(comments, topn=topn)
+    terms = [str(item.get("word") or "").strip() for item in weighted if isinstance(item, dict)]
+    if terms:
+        return [term for term in terms if term][:topn]
+    plain = extract_keywords(comments, topn=topn)
+    return [str(term).strip() for term in plain if str(term).strip()][:topn]
+
+
+def _build_negative_timeline(comments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    timed_comments: list[dict[str, Any]] = []
+    for comment in comments or []:
+        ts = _parse_comment_ts(comment.get("time"))
+        if ts is None:
+            continue
+        timed_comments.append({"ts": ts, "comment": comment})
+
+    if len(timed_comments) < 3:
+        return None
+
+    timed_comments.sort(key=lambda item: item["ts"])
+    span_seconds = max(0, timed_comments[-1]["ts"] - timed_comments[0]["ts"])
+    bucket_seconds, label_fmt, bucket_unit = _pick_timeline_bucket(span_seconds)
+    anchor = timed_comments[0]["ts"]
+    buckets: dict[int, dict[str, Any]] = {}
+
+    for entry in timed_comments:
+        ts = entry["ts"]
+        idx = 0 if bucket_seconds <= 0 else int((ts - anchor) // bucket_seconds)
+        bucket_ts = anchor + idx * bucket_seconds
+        bucket = buckets.setdefault(bucket_ts, {
+            "startTs": bucket_ts,
+            "items": [],
+            "negativeItems": [],
+            "controversyItems": [],
+            "totalCount": 0,
+            "negativeCount": 0,
+            "riskCount": 0,
+            "controversyCount": 0,
+        })
+        comment = entry["comment"]
+        sentiment = str(comment.get("sentiment") or "")
+        bucket["items"].append(comment)
+        bucket["totalCount"] += 1
+        if sentiment in ("neg", "risk"):
+            bucket["negativeCount"] += 1
+            bucket["negativeItems"].append(comment)
+        if sentiment == "risk":
+            bucket["riskCount"] += 1
+        if sentiment in ("neg", "risk", "con"):
+            bucket["controversyCount"] += 1
+            bucket["controversyItems"].append(comment)
+
+    points: list[dict[str, Any]] = []
+    for bucket_ts in sorted(buckets):
+        bucket = buckets[bucket_ts]
+        total_count = bucket["totalCount"]
+        negative_ratio = round(bucket["negativeCount"] * 100 / max(1, total_count), 1)
+        risk_ratio = round(bucket["riskCount"] * 100 / max(1, total_count), 1)
+        controversy_terms = _timeline_terms(bucket["controversyItems"], topn=3)
+        points.append({
+            "ts": bucket_ts,
+            "label": datetime.fromtimestamp(bucket_ts).strftime(label_fmt),
+            "totalCount": total_count,
+            "negativeCount": bucket["negativeCount"],
+            "negativeRatio": negative_ratio,
+            "riskCount": bucket["riskCount"],
+            "riskRatio": risk_ratio,
+            "controversyCount": bucket["controversyCount"],
+            "stage": _describe_timeline_stage(negative_ratio, bucket["negativeCount"], bucket["riskCount"]),
+            "keywords": controversy_terms,
+        })
+
+    if not points:
+        return None
+
+    negative_points = [point for point in points if point["negativeCount"] > 0]
+    controversy_comments = [entry["comment"] for entry in timed_comments if str(entry["comment"].get("sentiment") or "") in ("neg", "risk", "con")]
+    overall_terms = _timeline_terms(controversy_comments, topn=6)
+    spark_point = negative_points[0] if negative_points else points[0]
+    peak_point = max(negative_points or points, key=lambda point: (point["negativeRatio"], point["negativeCount"], point["riskCount"], point["totalCount"]))
+    latest_point = points[-1]
+
+    milestones: list[dict[str, Any]] = []
+    if spark_point["negativeCount"] > 0:
+        milestones.append({
+            "type": "spark",
+            "title": "首次露头",
+            "label": spark_point["label"],
+            "desc": f"这一时段开始出现可见负面讨论，负面/风险占比达到 {spark_point['negativeRatio']}%。",
+            "keywords": spark_point.get("keywords") or overall_terms[:2],
+            "stage": spark_point["stage"],
+        })
+
+    peak_title = "负面爆发峰值" if peak_point["stage"] == "爆发" else "负面升温拐点"
+    peak_desc = (
+        f"峰值时段共抓到 {peak_point['totalCount']} 条评论，"
+        f"其中负面/风险占比 {peak_point['negativeRatio']}%，风险评论 {peak_point['riskCount']} 条。"
+    )
+    milestones.append({
+        "type": "peak",
+        "title": peak_title,
+        "label": peak_point["label"],
+        "desc": peak_desc,
+        "keywords": peak_point.get("keywords") or overall_terms[:3],
+        "stage": peak_point["stage"],
+    })
+
+    if latest_point["label"] != peak_point["label"]:
+        latest_gap = peak_point["negativeRatio"] - latest_point["negativeRatio"]
+        latest_title = "当前仍在高压区" if latest_gap <= 8 else "当前进入回落观察"
+        latest_desc = (
+            f"最近时段负面/风险占比为 {latest_point['negativeRatio']}%，"
+            f"{'仍接近峰值，需持续关注。' if latest_gap <= 8 else f'较峰值回落 {round(latest_gap, 1)} 个百分点。'}"
+        )
+        milestones.append({
+            "type": "latest",
+            "title": latest_title,
+            "label": latest_point["label"],
+            "desc": latest_desc,
+            "keywords": latest_point.get("keywords") or overall_terms[:2],
+            "stage": latest_point["stage"],
+        })
+
+    if peak_point["negativeRatio"] >= 45:
+        summary = f"负面讨论出现明显爆发，峰值在 {peak_point['label']}，负面/风险占比达到 {peak_point['negativeRatio']}%。"
+    elif latest_point["negativeRatio"] > spark_point["negativeRatio"] + 10:
+        summary = f"负面情绪仍在抬升，最近时段比首次露头高出 {round(latest_point['negativeRatio'] - spark_point['negativeRatio'], 1)} 个百分点。"
+    elif latest_point["negativeRatio"] + 8 < peak_point["negativeRatio"]:
+        summary = f"负面声量已较峰值回落，但峰值阶段的争议点仍值得复核。"
+    else:
+        summary = "负面讨论呈阶段性波动，建议结合关键节点和高频争议词做复核。"
+
+    return {
+        "summary": summary,
+        "bucketUnit": bucket_unit,
+        "windowLabel": f"{points[0]['label']} → {points[-1]['label']}",
+        "totalTimedComments": len(timed_comments),
+        "peak": {
+            "label": peak_point["label"],
+            "negativeRatio": peak_point["negativeRatio"],
+            "riskCount": peak_point["riskCount"],
+            "totalCount": peak_point["totalCount"],
+        },
+        "keywords": overall_terms,
+        "points": points,
+        "milestones": milestones[:3],
+    }
+
+
+def _build_analysis_diagnostics(result: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    platform = result.get("platform") or ""
+    comment_count = int(result.get("commentCount", 0) or 0)
+    coverage = result.get("coverageRate")
+    degrade_reason = ((result.get("report") or {}).get("degrade_reason") or "").strip()
+
+    if result.get("needsLogin"):
+        diagnostics.append({
+            "code": "login_required",
+            "level": "warning",
+            "title": "当前抓取受登录态影响",
+            "impact": "评论样本可能明显偏少，情绪分布和聚类结果代表性会下降。",
+            "action": result.get("loginHint") or ("请补充登录信息后重试分析。" if platform != "小红书" else "请先登录小红书后重试分析。"),
+            "canContinue": True,
+        })
+
+    if result.get("playwrightMissing"):
+        diagnostics.append({
+            "code": "playwright_missing",
+            "level": "warning",
+            "title": "小红书签名服务不可用",
+            "impact": "无法稳定翻页获取更多评论，常见表现是评论数为 0 或远低于公开评论数。",
+            "action": "终端执行 playwright install chromium，完成后重启后端服务。",
+            "canContinue": True,
+        })
+
+    if comment_count == 0:
+        diagnostics.append({
+            "code": "no_comments",
+            "level": "danger",
+            "title": "当前没有拿到可分析评论",
+            "impact": "只能展示内容基础信息，舆情结论与风险判断都不可靠。",
+            "action": "优先检查登录状态、平台限流、评论区是否关闭，确认后重试。",
+            "canContinue": False,
+        })
+    elif coverage is not None and coverage < 25:
+        diagnostics.append({
+            "code": "low_coverage",
+            "level": "warning",
+            "title": "样本覆盖率偏低",
+            "impact": f"当前样本仅覆盖约 {coverage}% 的公开评论，结果更适合快速参考，不适合直接做正式结论。",
+            "action": "建议提高抓取页数，或补登录后重新分析。",
+            "canContinue": True,
+        })
+
+    degrade_map = {
+        "no_key": ("warning", "AI 报告已降级为模板", "无法生成 AI 深度总结与 Agent 推理结论。", "请配置可用的 LLM API Key 后重试。"),
+        "insufficient_balance": ("warning", "AI 报告余额不足", "报告已退回模板模式，深度总结能力受限。", "请充值或更换可用的 API Key 后重试。"),
+        "auth_failed": ("warning", "AI 报告鉴权失败", "报告已退回模板模式，AI 洞察未生成。", "请检查 API Key 是否正确、是否过期。"),
+        "rate_limited": ("warning", "AI 报告触发限流", "本次未拿到完整 AI 总结。", "稍后重试，或切换更稳定的模型配置。"),
+        "api_error": ("warning", "AI 报告调用失败", "本次未拿到完整 AI 总结。", "检查网络和模型服务状态后重试。"),
+    }
+    if degrade_reason and degrade_reason != "empty":
+        level, title, impact, action = degrade_map.get(degrade_reason, degrade_map["api_error"])
+        diagnostics.append({
+            "code": "llm_degraded",
+            "level": level,
+            "title": title,
+            "impact": impact,
+            "action": action,
+            "canContinue": True,
+        })
+
+    return diagnostics
+
+
+def _build_confidence_meta(result: dict[str, Any]) -> dict[str, Any]:
+    comment_count = int(result.get("commentCount", 0) or 0)
+    coverage = result.get("coverageRate")
+    diagnostics = result.get("diagnostics") or []
+    cluster_count = len(result.get("clusters") or [])
+    degrade_reason = ((result.get("report") or {}).get("degrade_reason") or "").strip()
+
+    score = 95
+    reasons: list[str] = []
+
+    if comment_count == 0:
+        score -= 60
+        reasons.append("暂无可分析评论")
+    elif comment_count < 5:
+        score -= 35
+        reasons.append("评论样本极少")
+    elif comment_count < 20:
+        score -= 20
+        reasons.append("评论样本偏少")
+    elif comment_count < 50:
+        score -= 8
+        reasons.append("样本规模一般")
+
+    if coverage is not None:
+        if coverage < 15:
+            score -= 24
+            reasons.append("样本覆盖率很低")
+        elif coverage < 40:
+            score -= 14
+            reasons.append("样本覆盖率偏低")
+        elif coverage < 70:
+            score -= 6
+            reasons.append("样本覆盖率中等")
+
+    if result.get("needsLogin"):
+        score -= 18
+        reasons.append("登录缺失影响抓取完整性")
+    if result.get("playwrightMissing"):
+        score -= 10
+        reasons.append("小红书签名服务不可用")
+    if degrade_reason and degrade_reason != "empty":
+        score -= 8
+        reasons.append("AI 报告降级为模板")
+    if cluster_count < 2 and comment_count >= 10:
+        score -= 5
+        reasons.append("观点聚类样本有限")
+    if any(d.get("code") == "no_comments" for d in diagnostics):
+        score = min(score, 28)
+
+    score = max(20, min(98, score))
+    if score >= 85:
+        grade = "A"
+        summary = "结果可信度高：样本相对充分，可直接用于判断当前舆情走向。"
+    elif score >= 70:
+        grade = "B"
+        summary = "结果可信度较高：可用于分析，但建议结合原始评论做少量复核。"
+    elif score >= 50:
+        grade = "C"
+        summary = "结果仅供参考：样本或链路存在限制，适合快速研判，不适合直接下结论。"
+    else:
+        grade = "D"
+        summary = "结果可信度较低：建议先补齐登录或修复抓取问题，再重新分析。"
+
+    return {
+        "grade": grade,
+        "score": score,
+        "summary": summary,
+        "reasons": reasons[:4],
+    }
+
+
+def _enrich_analysis_meta(result: dict[str, Any]) -> dict[str, Any]:
+    result["publicCommentCount"] = _resolve_public_comment_count(result)
+    result["coverageRate"] = _calc_coverage_rate(result)
+    result["diagnostics"] = _build_analysis_diagnostics(result)
+    result["confidence"] = _build_confidence_meta(result)
+    return result
+
+
+def _resolve_topic_public_comment_count(result: dict[str, Any]) -> int | None:
+    total = 0
+    known = False
+    for item in result.get("videos") or []:
+        value = item.get("publicCommentCount")
+        if value in (None, ""):
+            value = item.get("replyCountFromVideo", item.get("replyCountFromNote"))
+        if value in (None, ""):
+            continue
+        try:
+            total += int(value)
+            known = True
+        except (TypeError, ValueError):
+            continue
+    return total if known else None
+
+
+def _calc_topic_coverage_rate(result: dict[str, Any]) -> float | None:
+    public_count = result.get("publicCommentCount")
+    total_comments = int(result.get("totalComments", 0) or 0)
+    if public_count is None:
+        return None
+    try:
+        public_count = int(public_count)
+    except (TypeError, ValueError):
+        return None
+    if public_count <= 0:
+        return None if total_comments == 0 else 100.0
+    return round(min(100.0, total_comments * 100.0 / public_count), 1)
+
+
+def _build_topic_diagnostics(result: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    items = result.get("videos") or []
+    total_comments = int(result.get("totalComments", 0) or 0)
+    success_items = [item for item in items if not item.get("error")]
+    failed_items = [item for item in items if item.get("error")]
+    coverage = result.get("coverageRate")
+    platform = result.get("platform") or ("小红书" if result.get("type") == "xhs_topic" else "B站")
+
+    if failed_items:
+        diagnostics.append({
+            "code": "partial_failed",
+            "level": "warning",
+            "title": "部分内容分析失败",
+            "impact": f"当前仅成功分析 {len(success_items)}/{len(items)} 个{ '笔记' if platform == '小红书' else '视频' }，整体情绪与关键词可能偏向成功样本。",
+            "action": "优先检查失败项的登录态、平台限流或链接可用性后重试。",
+            "canContinue": True,
+        })
+
+    if any(item.get("needsLogin") for item in success_items):
+        login_hint = next((item.get("loginHint") for item in success_items if item.get("loginHint")), "")
+        diagnostics.append({
+            "code": "login_required",
+            "level": "warning",
+            "title": "登录态会影响聚合样本完整性",
+            "impact": f"{platform} 侧至少有一部分内容评论抓取受限，当前聚合结果可能低估负面或争议声量。",
+            "action": login_hint or "补充登录后重新执行话题分析，可显著提升评论覆盖率。",
+            "canContinue": True,
+        })
+
+    playwright_related = result.get("playwrightMissing") or any(item.get("playwrightMissing") for item in items) or any("playwright" in str(item.get("error", "")).lower() for item in failed_items)
+    if platform == "小红书" and playwright_related:
+        diagnostics.append({
+            "code": "playwright_missing",
+            "level": "warning",
+            "title": "小红书签名依赖不可用",
+            "impact": "无法稳定翻页获取更多评论，聚合样本可能明显偏少。",
+            "action": "终端执行 playwright install chromium，完成后重启后端服务。",
+            "canContinue": True,
+        })
+
+    if total_comments == 0:
+        diagnostics.append({
+            "code": "no_comments",
+            "level": "danger",
+            "title": "当前没有拿到可分析评论",
+            "impact": "无法形成可靠的话题判断，当前结果只适合检查链路，不适合作结论。",
+            "action": "优先补登录、排查限流或更换关键词后重新分析。",
+            "canContinue": False,
+        })
+    elif coverage is not None and coverage < 25:
+        diagnostics.append({
+            "code": "low_coverage",
+            "level": "warning",
+            "title": "聚合样本覆盖率偏低",
+            "impact": f"当前仅覆盖约 {coverage}% 的公开评论，更适合快速参考，不建议直接用于正式汇报。",
+            "action": "建议补登录、提高抓取页数，或减少单次分析内容数量后重试。",
+            "canContinue": True,
+        })
+
+    if result.get("llmSentimentEnhanced") is False and total_comments >= 30:
+        diagnostics.append({
+            "code": "llm_sentiment_off",
+            "level": "warning",
+            "title": "中性评论未做 LLM 二次增强",
+            "impact": "情感分布完全依赖词典法，复杂语义与反讽评论可能被低估。",
+            "action": "如需更细判断，可在设置中启用 LLM 情感增强。",
+            "canContinue": True,
+        })
+
+    return diagnostics
+
+
+def _build_topic_confidence_meta(result: dict[str, Any]) -> dict[str, Any]:
+    total_comments = int(result.get("totalComments", 0) or 0)
+    coverage = result.get("coverageRate")
+    items = result.get("videos") or []
+    success_count = sum(1 for item in items if not item.get("error"))
+    failed_count = sum(1 for item in items if item.get("error"))
+    score = 93
+    reasons: list[str] = []
+
+    if total_comments == 0:
+        score -= 60
+        reasons.append("暂无聚合评论样本")
+    elif total_comments < 20:
+        score -= 28
+        reasons.append("聚合评论样本偏少")
+    elif total_comments < 80:
+        score -= 12
+        reasons.append("样本规模一般")
+
+    if coverage is not None:
+        if coverage < 15:
+            score -= 22
+            reasons.append("公开评论覆盖率很低")
+        elif coverage < 40:
+            score -= 12
+            reasons.append("公开评论覆盖率偏低")
+        elif coverage < 70:
+            score -= 6
+            reasons.append("覆盖率中等")
+
+    if failed_count:
+        score -= min(20, failed_count * 6)
+        reasons.append(f"存在 {failed_count} 个内容分析失败")
+    if success_count and success_count < max(2, len(items)):
+        reasons.append(f"成功分析 {success_count}/{len(items)} 个内容")
+    if any(item.get("needsLogin") for item in items):
+        score -= 12
+        reasons.append("登录缺失影响部分样本完整性")
+    if result.get("playwrightMissing") or any(item.get("playwrightMissing") for item in items) or any("playwright" in str(item.get("error", "")).lower() for item in items):
+        score -= 8
+        reasons.append("小红书签名依赖未就绪")
+    if len(result.get("clusters") or []) < 2 and total_comments >= 15:
+        score -= 5
+        reasons.append("主题聚类信号有限")
+
+    score = max(20, min(98, score))
+    if score >= 85:
+        grade = "A"
+        summary = "聚合结果可信度高：样本较充分，可直接用于判断话题整体舆情。"
+    elif score >= 70:
+        grade = "B"
+        summary = "聚合结果可信度较高：可用于分析，但建议抽查失败项或少量原始评论。"
+    elif score >= 50:
+        grade = "C"
+        summary = "聚合结果仅供参考：样本或链路存在限制，更适合快速研判。"
+    else:
+        grade = "D"
+        summary = "聚合结果可信度较低：建议先修复抓取链路或补齐登录后再分析。"
+
+    return {
+        "grade": grade,
+        "score": score,
+        "summary": summary,
+        "reasons": reasons[:4],
+    }
+
+
+def _enrich_topic_meta(result: dict[str, Any]) -> dict[str, Any]:
+    items = result.get("videos") or []
+    result["successCount"] = sum(1 for item in items if not item.get("error"))
+    result["failedCount"] = sum(1 for item in items if item.get("error"))
+    result["publicCommentCount"] = _resolve_topic_public_comment_count(result)
+    result["coverageRate"] = _calc_topic_coverage_rate(result)
+    result["diagnostics"] = _build_topic_diagnostics(result)
+    result["confidence"] = _build_topic_confidence_meta(result)
+    return result
+
+
+def _build_compare_diagnostics(result: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    bili = result.get("bilibili")
+    xhs = result.get("xiaohongshu")
+
+    if not (bili and xhs):
+        missing = []
+        if not bili:
+            missing.append("B站")
+        if not xhs:
+            missing.append("小红书")
+        diagnostics.append({
+            "code": "platform_missing",
+            "level": "danger",
+            "title": "跨平台对比不完整",
+            "impact": f"当前缺少 {'、'.join(missing)} 侧结果，只能参考单平台表现，无法可靠判断平台差异。",
+            "action": "优先修复失败平台的登录、Cookie 或依赖问题后重新对比。",
+            "canContinue": False,
+        })
+
+    for key, label, data in (("bilibili", "B站", bili), ("xiaohongshu", "小红书", xhs)):
+        if not data:
+            continue
+        conf = data.get("confidence") or {}
+        if conf.get("grade") in ("C", "D"):
+            diagnostics.append({
+                "code": f"{key}_low_confidence",
+                "level": "warning",
+                "title": f"{label}侧样本可信度偏低",
+                "impact": f"{label} 当前可信度为 {conf.get('grade')}（{conf.get('score')} 分），对比结论容易被样本缺口放大。",
+                "action": (data.get("diagnostics") or [{}])[0].get("action") or f"先提升 {label} 侧评论覆盖率后再进行横向比较。",
+                "canContinue": True,
+            })
+    return diagnostics
+
+
+def _build_compare_confidence_meta(result: dict[str, Any]) -> dict[str, Any]:
+    bili = result.get("bilibili")
+    xhs = result.get("xiaohongshu")
+    scores = [item.get("confidence", {}).get("score") for item in (bili, xhs) if item and item.get("confidence")]
+    score = round(sum(scores) / len(scores)) if scores else 35
+    reasons: list[str] = []
+    if bili and bili.get("confidence"):
+        reasons.append(f"B站可信度 {bili['confidence'].get('grade')} / {bili['confidence'].get('score')} 分")
+    if xhs and xhs.get("confidence"):
+        reasons.append(f"小红书可信度 {xhs['confidence'].get('grade')} / {xhs['confidence'].get('score')} 分")
+    if not (bili and xhs):
+        score -= 18
+        reasons.append("缺少一侧平台结果，横向对比不完整")
+
+    score = max(20, min(98, score))
+    if score >= 85 and bili and xhs:
+        grade = "A"
+        summary = "跨平台对比可信度高：双平台样本都较完整，可以直接比较差异。"
+    elif score >= 70 and bili and xhs:
+        grade = "B"
+        summary = "跨平台对比可信度较高：可用于分析差异，但建议抽查关键评论。"
+    elif score >= 50:
+        grade = "C"
+        summary = "跨平台对比仅供参考：至少一侧样本存在限制，差异结论需谨慎。"
+    else:
+        grade = "D"
+        summary = "跨平台对比可信度较低：建议先修复失败平台或提升样本后再对比。"
+
+    return {
+        "grade": grade,
+        "score": score,
+        "summary": summary,
+        "reasons": reasons[:4],
+    }
+
+
+def _enrich_compare_meta(result: dict[str, Any]) -> dict[str, Any]:
+    result["diagnostics"] = _build_compare_diagnostics(result)
+    result["confidence"] = _build_compare_confidence_meta(result)
+    return result
 
 
 def analyze_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
@@ -1716,13 +2653,14 @@ def analyze_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
     keywords = extract_keywords(replies)
     keywords_weighted = extract_keywords_weighted(replies)
     clusters = build_clusters(replies)
+    negative_timeline = _build_negative_timeline(replies)
     hot_comments = sorted(replies, key=lambda x: x.get("likes", 0), reverse=True)[:30]
 
     stat = video.get("stat") or {}
     owner = video.get("owner") or {}
     public_reply_count = int(stat.get("reply", 0) or 0)
     needs_login = public_reply_count >= 20 and len(replies) <= 5 and "SESSDATA" not in load_user_cookies()
-    return {
+    result = {
         "sourceUrl": raw_url,
         "finalUrl": final_url,
         "bvid": bvid,
@@ -1758,10 +2696,12 @@ def analyze_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         "keywords": keywords,
         "keywordsWeighted": keywords_weighted,
         "clusters": clusters,
+        "negativeTimeline": negative_timeline,
         "comments": hot_comments,
         "report": make_report(video, replies, sentiments, keywords, clusters),
         "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    return _enrich_analysis_meta(result)
 
 
 def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
@@ -1803,6 +2743,7 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
     keywords = extract_keywords(comments_raw)
     keywords_weighted = extract_keywords_weighted(comments_raw)
     clusters = build_clusters(comments_raw)
+    negative_timeline = _build_negative_timeline(comments_raw)
     hot_comments = sorted(comments_raw, key=lambda x: x.get("likes", 0), reverse=True)[:30]
     
     logger.info(f"分析完成：sentiments={sentiments} risk={risk} keywords={len(keywords)} clusters={len(clusters)}")
@@ -1826,8 +2767,25 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         len(comments_raw) <= 5 and reply_count_from_note > 15
     )
     xhs_cookies = xhs_client.load_xhs_cookies()
-    
-    return {
+    # 检测 Playwright 是否可用，用于给出精确的诊断提示
+    playwright_available = False
+    try:
+        from analysis.xhs_login import _sign
+        playwright_available = True
+    except Exception:
+        pass
+
+    login_hint_parts = []
+    if needs_login:
+        if not xhs_cookies.get("a1"):
+            login_hint_parts.append("Cookie 未配置（缺少 a1/web_session）：点击右上角「登录 小红书」扫码配置。")
+        elif not playwright_available:
+            login_hint_parts.append("Playwright 签名服务不可用：终端执行 playwright install chromium 并重启服务器。")
+        else:
+            login_hint_parts.append("Cookie 可能已过期：请重新登录小红书。")
+    login_hint = "".join(login_hint_parts)
+
+    result = {
         "sourceUrl": raw_url,
         "finalUrl": final_url,
         "noteId": note_id,
@@ -1845,11 +2803,8 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         "commentCount": len(comments_raw),
         "replyCountFromNote": reply_count_from_note,
         "needsLogin": needs_login,
-        "loginHint": (
-            "小红书对未登录请求限流，只能获取少量评论。"
-            "请设置环境变量 XHS_A1 和 XHS_WEB_SESSION，"
-            "或在项目目录下创建 cookies_xhs.txt 写入 a1=xxx 和 web_session=xxx。"
-        ) if needs_login else "",
+        "playwrightMissing": not playwright_available,
+        "loginHint": login_hint,
         "risk": risk,
         "riskReason": reason,
         "sentiments": sentiment_percent,
@@ -1857,10 +2812,12 @@ def analyze_xhs_url(raw_url: str, pages: int = 5) -> dict[str, Any]:
         "keywords": keywords,
         "keywordsWeighted": keywords_weighted,
         "clusters": clusters,
+        "negativeTimeline": negative_timeline,
         "comments": hot_comments,
         "report": make_report(note_for_report, comments_raw, sentiments, keywords, clusters),
         "fetchedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    return _enrich_analysis_meta(result)
 
 
 def _calc_history_baseline(history: list[dict]) -> dict[str, float] | None:
@@ -1893,6 +2850,12 @@ def result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "riskReason": result.get("riskReason"),
         "commentCount": result.get("commentCount"),
         "replyCountFromVideo": result.get("replyCountFromVideo"),
+        "replyCountFromNote": result.get("replyCountFromNote"),
+        "publicCommentCount": result.get("publicCommentCount"),
+        "coverageRate": result.get("coverageRate"),
+        "confidence": result.get("confidence"),
+        "diagnostics": result.get("diagnostics"),
+        "playwrightMissing": result.get("playwrightMissing", False),
         "needsLogin": result.get("needsLogin", False),
         "loginHint": result.get("loginHint", ""),
         "sentiments": result.get("sentiments"),
@@ -2294,6 +3257,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self.json_response(400, {"ok": False, "error": str(exc)})
             return
 
+        if parsed.path == "/api/topic/compare":
+            query = urllib.parse.parse_qs(parsed.query)
+            keyword = (query.get("keyword") or [""])[0].strip()
+            top_n = int((query.get("topN") or ["5"])[0])
+            pages = int((query.get("pages") or ["3"])[0])
+            if not keyword:
+                self.json_response(400, {"ok": False, "error": "请输入话题关键词。"})
+                return
+            try:
+                result = analyze_topic_compare(keyword, top_n=min(max(1, top_n), 10), pages=min(max(1, pages), 10))
+                self.json_response(200, {"ok": True, "data": result})
+            except RuntimeError as exc:
+                self.json_response(502, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.json_response(400, {"ok": False, "error": str(exc)})
+            return
+
         # ---- 小红书 API ----
 
         if parsed.path == "/api/xhs/analyze":
@@ -2317,10 +3297,27 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/xhs/login/status":
             cookies = xhs_client.load_xhs_cookies()
             configured = bool(cookies.get("a1"))
+            # 额外检测 Playwright 是否可用
+            playwright_ok = False
+            playwright_missing = False
+            try:
+                import playwright  # noqa: F401
+                # 检查可执行文件是否存在
+                import subprocess
+                result_check = subprocess.run(
+                    ["python", "-c", "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); p.stop()"],
+                    capture_output=True, timeout=5
+                )
+                playwright_ok = result_check.returncode == 0
+                playwright_missing = not playwright_ok and ("Executable doesn't exist" in result_check.stderr.decode("utf-8", "replace") or "playwright install" in result_check.stderr.decode("utf-8", "replace"))
+            except Exception:
+                playwright_missing = True
             self.json_response(200, {
                 "ok": True,
                 "data": {
                     "configured": configured,
+                    "playwrightOk": playwright_ok,
+                    "playwrightMissing": playwright_missing,
                     "cookies": {k: v for k, v in cookies.items()} if configured else {},
                 },
             })
