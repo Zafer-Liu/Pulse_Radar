@@ -579,3 +579,30 @@ button:focus-visible, .btn:focus-visible { box-shadow: var(--sh-focus); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* ---------- 打印 / 导出 PDF ---------- */
+@media print {
+  @page { margin: 12mm; }
+  body { background: #fff !important; }
+  /* 隐藏非结果区域 */
+  .topbar,
+  .hero,
+  .monitor-section,
+  .first-run-hint,
+  .toast-wrap,
+  .no-print,
+  .export-btns,
+  .background-particles { display: none !important; }
+  /* 结果区铺满、去阴影、避免被截断 */
+  .wrap { max-width: 100% !important; padding: 0 !important; }
+  .card { box-shadow: none !important; border: 1px solid #e5e7eb !important; break-inside: avoid; }
+  .analysis-result, .topic-result, .topic-compare { break-inside: auto; }
+  .grid-analysis, .grid-topic { display: block !important; }
+  .grid-analysis > *, .grid-topic > * { width: 100% !important; }
+  /* 展开所有可折叠内容 */
+  .source-body { display: block !important; }
+  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+}
+/* 主动打印态：临时隐藏其它结果只留当前（由 useExport 触发） */
+body.printing .toast-wrap { display: none !important; }
+

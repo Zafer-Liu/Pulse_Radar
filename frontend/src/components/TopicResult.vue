@@ -1,12 +1,51 @@
 <template>
-  <section v-if="data" class="topic-result">
+  <section v-if="data" class="topic-result" id="export-capture-topic">
     <div class="section-title">
       <div>
         <h2>话题分析结果</h2>
         <span class="subtitle">{{ data.keyword }}</span>
       </div>
-      <span class="badge badge-neutral">{{ data.fetchedAt || '' }}</span>
+      <div class="title-actions">
+        <ExportButtons target-id="export-capture-topic" :file-name="`话题分析_${data.keyword}`" />
+        <span class="badge badge-neutral">{{ data.fetchedAt || '' }}</span>
+      </div>
     </div>
+
+    <section class="card export-summary-card">
+      <div class="export-summary-head">
+        <div>
+          <h3>汇报摘要</h3>
+          <p>话题级样本、可信度与诊断摘要会优先进入导出结果。</p>
+        </div>
+        <span class="export-summary-tag">阶段二 · 时间线版</span>
+      </div>
+      <div class="export-summary-grid">
+        <div class="summary-item">
+          <span>平台</span>
+          <b>{{ data.platform || (isXhs ? '小红书' : 'B站') }}</b>
+        </div>
+        <div class="summary-item">
+          <span>风险等级</span>
+          <b>{{ riskText[data.risk] || '未知风险' }}</b>
+        </div>
+        <div class="summary-item">
+          <span>可信度</span>
+          <b>{{ confidenceMeta.grade }} · {{ confidenceMeta.score }} 分</b>
+        </div>
+        <div class="summary-item">
+          <span>成功分析</span>
+          <b>{{ data.successCount ?? 0 }}/{{ data.analyzedCount ?? 0 }}</b>
+        </div>
+        <div class="summary-item">
+          <span>样本覆盖</span>
+          <b>{{ fmt(data.totalComments) }} / {{ publicCommentCountText }}</b>
+        </div>
+        <div class="summary-item wide">
+          <span>诊断摘要</span>
+          <b>{{ diagnostics.length ? diagnostics[0].title : '链路正常，可直接查看聚合结果' }}</b>
+        </div>
+      </div>
+    </section>
 
     <!-- 话题概览 -->
     <section class="card topic-overview">
@@ -21,6 +60,66 @@
         <div class="stat"><b>{{ fmt(data.totalComments) }}</b><span>聚合评论</span></div>
       </div>
     </section>
+
+    <section class="card topic-quality-card">
+      <div class="quality-head">
+        <div>
+          <h3>抓取透明度与可信度</h3>
+          <p class="quality-subtitle">聚合样本是否充分、是否有失败项、当前结论能不能直接拿来用</p>
+        </div>
+        <div class="confidence-pill" :class="confidenceToneClass">
+          <span class="confidence-grade">{{ confidenceMeta.grade }}</span>
+          <span class="confidence-score">{{ confidenceMeta.score }} 分</span>
+        </div>
+      </div>
+      <div class="quality-metrics">
+        <div class="quality-metric">
+          <span class="metric-k">成功分析</span>
+          <strong class="metric-v">{{ data.successCount ?? 0 }}/{{ data.analyzedCount ?? 0 }}</strong>
+          <span class="metric-note">成功抓到评论的内容数</span>
+        </div>
+        <div class="quality-metric">
+          <span class="metric-k">公开评论</span>
+          <strong class="metric-v">{{ publicCommentCountText }}</strong>
+          <span class="metric-note">可估算总量</span>
+        </div>
+        <div class="quality-metric">
+          <span class="metric-k">样本覆盖率</span>
+          <strong class="metric-v">{{ coverageText }}</strong>
+          <span class="metric-note">聚合评论 / 公开评论</span>
+        </div>
+        <div class="quality-metric">
+          <span class="metric-k">当前状态</span>
+          <strong class="metric-v">{{ topicStatusLabel }}</strong>
+          <span class="metric-note">{{ topicStatusDesc }}</span>
+        </div>
+      </div>
+      <div class="quality-summary">{{ confidenceMeta.summary }}</div>
+      <ul v-if="confidenceMeta.reasons?.length" class="quality-reasons">
+        <li v-for="(reason, idx) in confidenceMeta.reasons" :key="idx">{{ reason }}</li>
+      </ul>
+    </section>
+
+    <section v-if="diagnostics.length" class="card diagnostics-card">
+      <div class="diagnostics-head">
+        <h3>分析诊断</h3>
+        <span class="diagnostics-count">{{ diagnostics.length }} 项</span>
+      </div>
+      <div class="diagnostics-list">
+        <div v-for="item in diagnostics" :key="item.code" class="diagnosis-item" :class="item.level">
+          <div class="diagnosis-top">
+            <strong>{{ item.title }}</strong>
+            <span class="diagnosis-continue" :class="{ off: item.canContinue === false }">
+              {{ item.canContinue === false ? '建议先修复' : '可继续查看结果' }}
+            </span>
+          </div>
+          <p><span>影响：</span>{{ item.impact }}</p>
+          <p><span>建议：</span>{{ item.action }}</p>
+        </div>
+      </div>
+    </section>
+
+    <NegativeTimelineCard :timeline="data.negativeTimeline" />
 
     <div class="grid grid-topic">
       <!-- 左主区 -->
@@ -132,6 +231,8 @@
 import { computed } from 'vue'
 import SentimentRing from './charts/SentimentRing.vue'
 import EmptyState from './ui/EmptyState.vue'
+import ExportButtons from './ExportButtons.vue'
+import NegativeTimelineCard from './NegativeTimelineCard.vue'
 
 const props = defineProps({ data: Object })
 
@@ -141,6 +242,23 @@ const riskText = { low: '低风险', medium: '中风险', high: '高风险', unk
 
 // 判断是否为小红书话题分析结果
 const isXhs = computed(() => props.data?.type === 'xhs_topic')
+const diagnostics = computed(() => props.data?.diagnostics || [])
+const confidenceMeta = computed(() => props.data?.confidence || { grade: 'C', score: 60, summary: '当前缺少可信度评估数据。', reasons: [] })
+const confidenceToneClass = computed(() => ({ A: 'tone-a', B: 'tone-b', C: 'tone-c', D: 'tone-d' }[confidenceMeta.value.grade] || 'tone-c'))
+const publicCommentCountText = computed(() => props.data?.publicCommentCount == null ? '未知' : fmt(props.data.publicCommentCount))
+const coverageText = computed(() => props.data?.coverageRate == null ? '未知' : `${props.data.coverageRate}%`)
+const topicStatusLabel = computed(() => {
+  if ((props.data?.totalComments || 0) === 0) return '需重试'
+  if ((props.data?.failedCount || 0) > 0) return '部分受限'
+  if (props.data?.coverageRate != null && props.data.coverageRate < 40) return '偏低'
+  return '正常'
+})
+const topicStatusDesc = computed(() => {
+  if ((props.data?.totalComments || 0) === 0) return '当前没有聚合到可分析评论'
+  if ((props.data?.failedCount || 0) > 0) return '部分内容分析失败，结论偏向成功样本'
+  if (props.data?.coverageRate != null && props.data.coverageRate < 40) return '建议补登录或减少单次分析范围'
+  return '样本可直接用于当前话题研判'
+})
 
 function segClass(k) {
   return { pos: 'seg-pos', neu: 'seg-neu', neg: 'seg-neg', con: 'seg-con', risk: 'seg-risk' }[k] || ''
@@ -173,8 +291,135 @@ function renderMd(text) {
 
 <style scoped>
 .topic-result { margin-bottom: var(--sp-5); }
+.title-actions { display: flex; align-items: center; gap: var(--sp-3); }
+.export-summary-card { margin-bottom: var(--sp-4); }
+.export-summary-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+.export-summary-head h3 { margin: 0; }
+.export-summary-head p {
+  margin: 4px 0 0;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  line-height: var(--lh-base);
+}
+.export-summary-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(0,47,167,0.08);
+  border: 1px solid rgba(0,47,167,0.16);
+  color: var(--brand);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+}
+.export-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-3);
+}
+.summary-item {
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--fill-1);
+  border: 1px solid var(--border-2);
+}
+.summary-item.wide { grid-column: span 2; }
+.summary-item span { display: block; font-size: var(--fs-2xs); color: var(--text-3); }
+.summary-item b {
+  display: block;
+  margin-top: 6px;
+  font-size: var(--fs-sm);
+  color: var(--text-1);
+  line-height: var(--lh-base);
+}
 
 .topic-overview { margin-bottom: var(--sp-4); }
+.topic-quality-card { margin-bottom: var(--sp-4); }
+.quality-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+.quality-subtitle {
+  margin-top: 4px;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  line-height: var(--lh-base);
+}
+.quality-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+.quality-metric {
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--fill-1);
+  border: 1px solid var(--border-2);
+}
+.quality-summary {
+  padding: var(--sp-3);
+  border-radius: var(--r-md);
+  background: rgba(0,47,167,0.05);
+  border: 1px solid rgba(0,47,167,0.12);
+  color: var(--text-1);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-loose);
+}
+.quality-reasons {
+  margin: var(--sp-3) 0 0;
+  padding-left: 18px;
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-loose);
+}
+.metric-k { display: block; font-size: var(--fs-xs); color: var(--text-3); }
+.metric-v { display: block; margin-top: 6px; font-size: var(--fs-lg); color: var(--text-1); font-variant-numeric: tabular-nums; }
+.metric-note { display: block; margin-top: 4px; font-size: var(--fs-2xs); color: var(--text-4); }
+.confidence-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.confidence-grade { font-size: var(--fs-sm); font-weight: 700; }
+.confidence-score { font-size: var(--fs-xs); color: inherit; opacity: 0.9; }
+.confidence-pill.tone-a { background: rgba(22,163,74,0.08); border-color: rgba(22,163,74,0.18); color: #15803d; }
+.confidence-pill.tone-b { background: rgba(0,47,167,0.08); border-color: rgba(0,47,167,0.18); color: var(--brand); }
+.confidence-pill.tone-c { background: rgba(217,119,6,0.08); border-color: rgba(217,119,6,0.18); color: #b45309; }
+.confidence-pill.tone-d { background: rgba(220,38,38,0.08); border-color: rgba(220,38,38,0.18); color: #dc2626; }
+.diagnostics-card { margin-bottom: var(--sp-4); }
+.diagnostics-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--sp-3); }
+.diagnostics-count {
+  font-size: var(--fs-2xs);
+  color: var(--text-3);
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-2);
+}
+.diagnostics-list { display: flex; flex-direction: column; gap: var(--sp-3); }
+.diagnosis-item { padding: var(--sp-3); border-radius: var(--r-md); border: 1px solid var(--border-2); background: var(--bg-soft); }
+.diagnosis-item.warning { background: rgba(217,119,6,0.06); border-color: rgba(217,119,6,0.18); }
+.diagnosis-item.danger { background: rgba(220,38,38,0.05); border-color: rgba(220,38,38,0.16); }
+.diagnosis-top { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--sp-2); margin-bottom: 6px; }
+.diagnosis-top strong { color: var(--text-1); font-size: var(--fs-sm); }
+.diagnosis-continue { flex-shrink: 0; font-size: var(--fs-2xs); color: #15803d; background: rgba(22,163,74,0.08); border: 1px solid rgba(22,163,74,0.16); padding: 2px 8px; border-radius: 999px; }
+.diagnosis-continue.off { color: #b45309; background: rgba(217,119,6,0.08); border-color: rgba(217,119,6,0.16); }
+.diagnosis-item p { margin: 0; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh-loose); }
+.diagnosis-item p + p { margin-top: 4px; }
+.diagnosis-item p span { color: var(--text-3); margin-right: 4px; }
 .overview-head {
   display: flex;
   align-items: center;
@@ -373,5 +618,12 @@ function renderMd(text) {
 @media (max-width: 900px) {
   .grid-topic { grid-template-columns: 1fr; }
   .clusters { grid-template-columns: 1fr; }
+  .quality-metrics { grid-template-columns: 1fr 1fr; }
+  .export-summary-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 640px) {
+  .quality-head, .export-summary-head { flex-direction: column; }
+  .quality-metrics, .export-summary-grid { grid-template-columns: 1fr; }
+  .summary-item.wide { grid-column: span 1; }
 }
 </style>

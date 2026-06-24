@@ -38,6 +38,18 @@
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" width="13" height="13"><path d="M8 1l5 2v5c0 3-2 5-5 6-3-1-5-3-5-6V3z" stroke-linejoin="round"/></svg>
           登录态仅写入本机 cookies_xhs.txt，二维码本地生成，不发送第三方。
         </div>
+
+        <!-- Playwright 未安装提示 -->
+        <div v-if="playwrightMissing" class="playwright-warn">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1L1 14h14L8 1z" stroke-linejoin="round"/><path d="M8 6v4M8 12h.01" stroke-linecap="round"/></svg>
+          <div>
+            <strong>Playwright 未安装</strong> —— 小红书评论 API 依赖 Playwright 无头浏览器进行签名，未安装时只能获取 HTML 中的有限评论（通常 0 条），无法翻页。
+            <br>请在终端执行以下命令，然后重启服务器：
+            <code class="pw-cmd">playwright install chromium</code>
+            <span>如果提示找不到 playwright，先安装：</span>
+            <code class="pw-cmd">pip install playwright</code>
+          </div>
+        </div>
       </div>
     </div>
   </transition>
@@ -46,7 +58,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
 import QRCode from 'qrcode'
-import { apiPost } from '../api'
+import { apiPost, apiGet } from '../api'
 import { toast } from '../composables/useToast'
 
 const props = defineProps({ show: Boolean })
@@ -57,6 +69,7 @@ const qrcodeDataUrl = ref('')
 const status = ref('loading')
 const message = ref('正在生成二维码…')
 const loading = ref(false)
+const playwrightMissing = ref(false)
 let pollTimer = null
 let qrId = ''
 let qrCode = ''
@@ -145,6 +158,11 @@ watch(() => props.show, async (val) => {
     await nextTick()
     cardRef.value?.focus()
     document.body.style.overflow = 'hidden'
+    // 检测 Playwright 状态
+    try {
+      const res = await apiGet('/api/xhs/login/status')
+      playwrightMissing.value = !!res.data?.playwrightMissing
+    } catch { /* 静默 */ }
     startQrcode()
   } else {
     document.body.style.overflow = ''
@@ -166,6 +184,21 @@ onUnmounted(stopPolling)
   margin-top: var(--sp-3); padding: var(--sp-2) var(--sp-3);
   background: var(--fill-1); border-radius: var(--r-md);
   color: var(--text-3); font-size: var(--fs-xs); line-height: var(--lh-base);
+}
+.playwright-warn {
+  display: flex; gap: 10px; align-items: flex-start;
+  margin-top: var(--sp-3); padding: var(--sp-3);
+  background: rgba(234,179,8,.08); border: 1px solid rgba(234,179,8,.25);
+  border-radius: var(--r-md); font-size: var(--fs-sm); line-height: 1.6;
+  color: var(--text-2);
+}
+.playwright-warn svg { color: #ca8a04; flex-shrink: 0; margin-top: 2px; }
+.playwright-warn strong { color: var(--text-1); }
+.pw-cmd {
+  display: block; margin: 6px 0; padding: 4px 10px;
+  background: var(--fill-2); border-radius: var(--r-sm);
+  font-family: monospace; font-size: var(--fs-xs); color: var(--text-1);
+  user-select: all;
 }
 .modal-security svg { color: var(--success); flex-shrink: 0; margin-top: 2px; }
 .spinner { display: inline-block; border: 2px solid var(--border-1); border-top-color: var(--brand-2); border-radius: 50%; animation: spin .7s linear infinite; }

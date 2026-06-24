@@ -21,6 +21,9 @@
         <span v-if="result.risk" :class="['risk', `risk-${result.risk}`]">
           {{ riskText[result.risk] || '未知风险' }}
         </span>
+        <span v-if="result.confidence?.grade" class="confidence-chip" :class="`grade-${result.confidence.grade}`">
+          可信度 {{ result.confidence.grade }} · {{ result.confidence.score }} 分
+        </span>
         <div class="meta">
           <span>每 {{ monitor.intervalValue }} {{ monitor.intervalUnit }}</span>
           <span>{{ monitor.pages }} 页评论</span>
@@ -31,9 +34,30 @@
 
       <p v-if="monitor.lastError" class="error-text">{{ monitor.lastError }}</p>
 
-      <div v-if="result.needsLogin" class="login-hint">
-        <strong>抓取不全</strong> · 实抓 {{ fmt(result.commentCount || 0) }} 条 / 公开 {{ fmt(result.replyCountFromVideo || 0) }} 条。{{ result.loginHint || '请配置 SESSDATA 后再检测。' }}
+      <div v-if="primaryDiagnostic" class="monitor-diagnostic" :class="primaryDiagnostic.level">
+        <strong>{{ primaryDiagnostic.title }}</strong>
+        <span>{{ primaryDiagnostic.action }}</span>
       </div>
+
+      <div v-if="result.commentCount || result.publicCommentCount || result.coverageRate != null || result.confidence" class="monitor-quality-grid">
+        <div class="quality-item">
+          <span>本次抓取</span>
+          <b>{{ fmt(result.commentCount) }}</b>
+        </div>
+        <div class="quality-item">
+          <span>公开评论</span>
+          <b>{{ publicCommentText }}</b>
+        </div>
+        <div class="quality-item">
+          <span>覆盖率</span>
+          <b>{{ coverageText }}</b>
+        </div>
+        <div class="quality-item">
+          <span>当前状态</span>
+          <b>{{ monitorQualityStatus }}</b>
+        </div>
+      </div>
+      <p v-if="result.confidence" class="confidence-summary">{{ confidenceSummary }}</p>
 
       <p v-if="result.riskReason" class="risk-reason">{{ result.riskReason }}</p>
       <p v-else-if="!result.risk" class="text-muted text-sm">添加后会在后台自动执行首次检测。</p>
@@ -134,6 +158,20 @@ const trendData = computed(() => {
 const trendPosData = computed(() => trendData.value.map(d => ({ label: d.label, value: d.pos })))
 const trendNeuData = computed(() => trendData.value.map(d => ({ label: d.label, value: d.neu })))
 const trendNegData = computed(() => trendData.value.map(d => ({ label: d.label, value: d.neg })))
+const primaryDiagnostic = computed(() => (result.value.diagnostics || [])[0] || null)
+const publicCommentText = computed(() => {
+  const raw = result.value.publicCommentCount ?? result.value.replyCountFromVideo ?? result.value.replyCountFromNote
+  if (raw == null || raw === '') return '未知'
+  return fmt(raw)
+})
+const coverageText = computed(() => result.value.coverageRate == null ? '未知' : `${result.value.coverageRate}%`)
+const monitorQualityStatus = computed(() => {
+  if (!result.value.commentCount) return '待补样'
+  if (result.value.needsLogin) return '受限'
+  if (result.value.coverageRate != null && result.value.coverageRate < 40) return '偏低'
+  return '正常'
+})
+const confidenceSummary = computed(() => result.value.confidence?.summary || '等待首次检测后生成可信度判断。')
 
 function riskBadgeClass(risk) {
   return { low: 'success', medium: 'warning', high: 'danger', unknown: 'neutral' }[risk] || 'neutral'
@@ -163,6 +201,91 @@ function onCoverError(e) {
 .monitor-meta-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-2); }
 .error-text { color: var(--danger); font-size: var(--fs-sm); margin: var(--sp-1) 0; }
 .risk-reason { color: var(--text-2); font-size: var(--fs-sm); line-height: var(--lh-base); margin: var(--sp-1) 0 0; }
+.confidence-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+.confidence-chip.grade-A {
+  color: #15803d;
+  background: rgba(22,163,74,0.08);
+  border-color: rgba(22,163,74,0.16);
+}
+.confidence-chip.grade-B {
+  color: var(--brand);
+  background: rgba(0,47,167,0.08);
+  border-color: rgba(0,47,167,0.16);
+}
+.confidence-chip.grade-C {
+  color: #b45309;
+  background: rgba(217,119,6,0.08);
+  border-color: rgba(217,119,6,0.16);
+}
+.confidence-chip.grade-D {
+  color: #dc2626;
+  background: rgba(220,38,38,0.08);
+  border-color: rgba(220,38,38,0.16);
+}
+.monitor-quality-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.quality-item {
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  background: var(--fill-1);
+  border: 1px solid var(--border-2);
+}
+.quality-item span {
+  display: block;
+  font-size: var(--fs-2xs);
+  color: var(--text-3);
+}
+.quality-item b {
+  display: block;
+  margin-top: 4px;
+  font-size: var(--fs-sm);
+  color: var(--text-1);
+}
+.confidence-summary {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  line-height: var(--lh-base);
+}
+.monitor-diagnostic {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  margin-top: var(--sp-2);
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-2);
+  background: var(--fill-1);
+}
+.monitor-diagnostic.warning {
+  background: rgba(217,119,6,0.06);
+  border-color: rgba(217,119,6,0.16);
+}
+.monitor-diagnostic.danger {
+  background: rgba(220,38,38,0.05);
+  border-color: rgba(220,38,38,0.16);
+}
+.monitor-diagnostic strong {
+  font-size: var(--fs-sm);
+  color: var(--text-1);
+}
+.monitor-diagnostic span {
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  line-height: var(--lh-base);
+}
 .monitor-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-3); }
 
 .history-section { margin-top: var(--sp-3); border-top: 1px solid var(--border-2); padding-top: var(--sp-2); }
@@ -218,9 +341,11 @@ function onCoverError(e) {
 @media (max-width: 1024px) {
   .monitor-item { grid-template-columns: 140px 1fr; }
   .monitor-cover { width: 140px; }
+  .monitor-quality-grid { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 768px) {
   .monitor-item { grid-template-columns: 1fr; }
   .monitor-cover { width: 100%; max-height: 180px; }
+  .monitor-quality-grid { grid-template-columns: 1fr; }
 }
 </style>

@@ -18,17 +18,21 @@
       <UnifiedInput
         @result="onResult"
         @topic-result="onTopicResult"
+        @compare-result="onCompareResult"
         @add="onAddMonitor"
       />
 
       <!-- 视频分析结果 -->
-      <AnalysisResult :data="analysisData" />
+      <AnalysisResult :data="analysisData" @open-settings="settingsShow = true" />
 
       <!-- 话题分析结果 -->
       <TopicResult :data="topicData" />
 
+      <!-- 双平台对比结果 -->
+      <TopicCompare :data="compareData" />
+
       <!-- 无数据时的引导 -->
-      <div v-if="!analysisData && !topicData && !monitors.monitors.value.length" class="first-run-hint card">
+      <div v-if="!analysisData && !topicData && !compareData && !monitors.monitors.value.length" class="first-run-hint card">
         <div class="hint-icon">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="32" height="32"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" stroke-linecap="round"/></svg>
         </div>
@@ -128,6 +132,7 @@ import UnifiedInput from './components/UnifiedInput.vue'
 import MonitorCard from './components/MonitorCard.vue'
 import AnalysisResult from './components/AnalysisResult.vue'
 import TopicResult from './components/TopicResult.vue'
+import TopicCompare from './components/TopicCompare.vue'
 import LoginModal from './components/LoginModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import AlertModal from './components/AlertModal.vue'
@@ -144,6 +149,7 @@ const monitors = useMonitors()
 
 const analysisData = ref(null)
 const topicData = ref(null)
+const compareData = ref(null)
 const settingsShow = ref(false)
 const alertShow = ref(false)
 const alertConfigured = ref(false)
@@ -155,6 +161,10 @@ async function loadXhsStatus() {
   try {
     const res = await apiGet('/api/xhs/login/status')
     xhsLoggedIn.value = !!res.data?.configured
+    // Playwright 未安装时提示（仅未登录状态下提示）
+    if (res.data?.playwrightMissing && !xhsLoggedIn.value) {
+      toast.warning('小红书签名依赖 Playwright，需先运行 playwright install chromium，否则只能获取 HTML 中的有限评论', 8000)
+    }
   } catch {
     xhsLoggedIn.value = false
   }
@@ -182,14 +192,46 @@ async function loadAlertStatus() {
 }
 onMounted(() => { initAuth(); loadAlertStatus(); loadXhsStatus() })
 
+// LLM 降级原因 → toast 文案（与 AnalysisResult 的 DEGRADE_MAP 对齐）
+const DEGRADE_TOAST = {
+  no_key: ['info', '未配置 LLM，已降级为模板报告'],
+  insufficient_balance: ['error', 'LLM 余额不足，已降级为模板报告，请充值后重试'],
+  auth_failed: ['error', 'LLM API Key 无效，已降级为模板报告，请检查配置'],
+  rate_limited: ['warning', 'LLM 触发限流，已降级为模板报告，请稍后重试'],
+  api_error: ['warning', 'LLM 调用失败，已降级为模板报告'],
+}
+
+function notifyDegrade(data) {
+  const r = data?.report
+  if (!r || r.ai_generated) return
+  const reason = r.degrade_reason
+  if (!reason || reason === 'empty') return
+  const [type, msg] = DEGRADE_TOAST[reason] || DEGRADE_TOAST.api_error
+  ;(toast[type] || toast.warning)(msg)
+}
+
 function onResult(data) {
   analysisData.value = data
   topicData.value = null // 切换时清空话题结果
+  compareData.value = null
+  notifyDegrade(data)
 }
 
 function onTopicResult(data) {
   topicData.value = data
   analysisData.value = null // 切换时清空视频结果
+  compareData.value = null
+}
+
+function onCompareResult(data) {
+  compareData.value = data
+  analysisData.value = null
+  topicData.value = null
+  // 滚动到对比结果
+  setTimeout(() => {
+    const el = document.querySelector('.topic-compare')
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, 100)
 }
 
 function onAddMonitor(data) {
@@ -206,7 +248,9 @@ async function onShowDetail(id) {
     }
     analysisData.value = result
     topicData.value = null
+    compareData.value = null
     toast.success('已加载历史结果')
+    notifyDegrade(result)
     const el = document.querySelector('.analysis-result')
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
   } catch (err) {

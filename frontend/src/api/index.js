@@ -121,6 +121,11 @@ export function analyzeTopic(keyword, topN = 5, pages = 3) {
   return apiGet(`/api/topic/analyze?keyword=${encodeURIComponent(keyword)}&topN=${topN}&pages=${pages}`)
 }
 
+// ---- 双平台对比 ----
+export function compareTopic(keyword, topN = 5, pages = 3) {
+  return apiGet(`/api/topic/compare?keyword=${encodeURIComponent(keyword)}&topN=${topN}&pages=${pages}`)
+}
+
 // ---- Agent ----
 export function getAgentTrace(monitorId) {
   return apiGet(`/api/agent/trace?monitor_id=${encodeURIComponent(monitorId)}`)
